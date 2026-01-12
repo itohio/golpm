@@ -45,7 +45,7 @@ func NewMock(cfg *config.MockConfig) *Mock {
 			LaserPower:    40.0,
 			LaserDuration: 2 * time.Second,
 			LaserPeriod:   20 * time.Second,
-			SampleRate:    100 * time.Millisecond,
+			SampleRate:    20 * time.Millisecond, // 50 samples per second
 		}
 	}
 

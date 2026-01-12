@@ -4,11 +4,14 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"sync"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 	"github.com/itohio/golpm/pkg/config"
 	"github.com/itohio/golpm/pkg/lpm"
@@ -69,9 +72,6 @@ func main() {
 	scopeWidget := scope.New(cfg)
 	appState.scopeWidget = scopeWidget
 
-	// Note: Callback registration moved to handleConnect() to ensure
-	// it's set up when the measurement chain is created
-
 	// Create border layout with toolbar at top and scope widget as content
 	container := container.NewBorder(
 		toolbar,
@@ -109,46 +109,53 @@ type appState struct {
 	useMock     bool
 	heaterState [3]bool           // Current heater states [heater1, heater2, heater3]
 	chain       *measurementChain // Current measurement chain (nil if not connected)
+
+	// Throttling for scope updates
+	lastUpdateTime time.Time
+	updateMu       sync.Mutex
 }
 
 // createToolbar creates the application toolbar with Connect, Settings, Measure, and Heater buttons.
 func createToolbar(state *appState) fyne.CanvasObject {
-	connectBtn := widget.NewButton("Connect", func() {
+	// Connect button with icon
+	connectBtn := widget.NewButtonWithIcon("", theme.LoginIcon(), func() {
 		handleConnect(state)
 	})
 	state.connectBtn = connectBtn
 
-	settingsBtn := widget.NewButton("Settings", func() {
+	// Settings button with icon
+	settingsBtn := widget.NewButtonWithIcon("", theme.SettingsIcon(), func() {
 		showSettingsDialog(state)
 	})
 
-	// Create heater buttons
-	heater1Btn := widget.NewButton(fmt.Sprintf("H1 (~%.0fΩ)", state.cfg.Heaters[0].Resistance), func() {
+	// Create heater buttons with icon (using InfoIcon as placeholder for resistor-like component)
+	// Tooltips would show resistance values, but Fyne buttons don't support tooltips directly
+	// Users can see resistance values in the settings dialog
+	heater1Btn := widget.NewButtonWithIcon("", theme.InfoIcon(), func() {
 		handleHeaterToggle(state, 0)
 	})
 	heater1Btn.Disable()
 	state.heater1Btn = heater1Btn
 
-	heater2Btn := widget.NewButton(fmt.Sprintf("H2 (~%.0fΩ)", state.cfg.Heaters[1].Resistance), func() {
+	heater2Btn := widget.NewButtonWithIcon("", theme.InfoIcon(), func() {
 		handleHeaterToggle(state, 1)
 	})
 	heater2Btn.Disable()
 	state.heater2Btn = heater2Btn
 
-	heater3Btn := widget.NewButton(fmt.Sprintf("H3 (~%.0fΩ)", state.cfg.Heaters[2].Resistance), func() {
+	heater3Btn := widget.NewButtonWithIcon("", theme.InfoIcon(), func() {
 		handleHeaterToggle(state, 2)
 	})
 	heater3Btn.Disable()
 	state.heater3Btn = heater3Btn
 
-	// Create horizontal box for toolbar with separator
-	return container.NewHBox(
-		connectBtn,
-		settingsBtn,
-		widget.NewSeparator(),
-		heater1Btn,
-		heater2Btn,
-		heater3Btn,
+	// Create toolbar with buttons on left and heater buttons aligned to the right
+	return container.NewBorder(
+		nil, // top
+		nil, // bottom
+		container.NewHBox(connectBtn, settingsBtn),            // left
+		container.NewHBox(heater1Btn, heater2Btn, heater3Btn), // right
+		nil, // center (spacer)
 	)
 }
 
@@ -184,7 +191,7 @@ func handleConnect(state *appState) {
 		closeMeasurementChain(state.chain)
 		state.chain = nil
 		state.device = nil
-		state.connectBtn.SetText("Connect")
+		// Connect button icon doesn't change
 		state.heater1Btn.Disable()
 		state.heater2Btn.Disable()
 		state.heater3Btn.Disable()
@@ -215,7 +222,6 @@ func handleConnect(state *appState) {
 			return
 		}
 		state.device = device
-		state.connectBtn.SetText("Disconnect")
 		if state.useMock {
 			fmt.Printf("Connected to mocked device\n")
 		} else {
@@ -232,12 +238,30 @@ func handleConnect(state *appState) {
 
 		// Register callback with power meter to update scope widget
 		// This must be done before starting the measurement chain
+		// Throttle updates to ~60 FPS (16.67ms between updates) to ensure smooth UI
+		const updateInterval = 16 * time.Millisecond // ~60 FPS
 		state.powerMeter.OnUpdate(func(samples []sample.Sample, derivatives []float64, pulses []meter.Pulse) {
+			// Throttle updates to prevent UI from being overwhelmed
+			state.updateMu.Lock()
+			now := time.Now()
+			timeSinceLastUpdate := now.Sub(state.lastUpdateTime)
+			state.updateMu.Unlock()
+
+			// Skip update if too soon since last update
+			if timeSinceLastUpdate < updateInterval {
+				return
+			}
+
 			// Calculate current heater power from latest sample
 			var heaterPower float64
 			if len(samples) > 0 {
 				heaterPower = samples[len(samples)-1].HeaterPower
 			}
+
+			// Update timestamp
+			state.updateMu.Lock()
+			state.lastUpdateTime = now
+			state.updateMu.Unlock()
 
 			// Update scope widget on main thread
 			// Scope widget handles downsampling internally, so pass full data
