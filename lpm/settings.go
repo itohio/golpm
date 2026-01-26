@@ -9,6 +9,7 @@ import (
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
+	"github.com/itohio/golpm/pkg/config"
 	"github.com/itohio/golpm/pkg/lpm"
 	"github.com/itohio/golpm/pkg/meter"
 )
@@ -201,39 +202,97 @@ func createMeasurementTab(state *appState) *container.TabItem {
 	windowSecondsEntry.SetText(fmt.Sprintf("%.1f", state.cfg.Measurement.WindowSeconds))
 
 	pulseThresholdEntry := widget.NewEntry()
-	pulseThresholdEntry.SetText(fmt.Sprintf("%.6f", state.cfg.Measurement.PulseThreshold))
+	pulseThresholdEntry.SetText(fmt.Sprintf("%.3f", state.cfg.Measurement.PulseThresholdMVS))
+
+	pulseLineFitRangeEntry := widget.NewEntry()
+	pulseLineFitRangeEntry.SetText(fmt.Sprintf("%.3f", state.cfg.Measurement.PulseLineFitRangeMVS))
 
 	minPulseDurationEntry := widget.NewEntry()
 	minPulseDurationEntry.SetText(fmt.Sprintf("%.1f", state.cfg.Measurement.MinPulseDuration))
 
-	averageSamplesEntry := widget.NewEntry()
-	averageSamplesEntry.SetText(fmt.Sprintf("%d", state.cfg.Measurement.AverageSamples))
+	smoothingAlphaEntry := widget.NewEntry()
+	smoothingAlphaEntry.SetText(fmt.Sprintf("%.2f", state.cfg.Measurement.SmoothingAlpha))
+
+	spikeFilterWindowSizeEntry := widget.NewEntry()
+	spikeFilterWindowSizeEntry.SetText(state.cfg.Measurement.SpikeFilterWindowSize.String())
+
+	downsampleRateEntry := widget.NewEntry()
+	if state.cfg.Measurement.DownsampleRate != nil {
+		downsampleRateEntry.SetText(state.cfg.Measurement.DownsampleRate.String())
+	} else {
+		// Show default value (1s) but user can change it
+		downsampleRateEntry.SetText("1s")
+	}
+
+	changeFilterTypeSelect := widget.NewSelect([]string{"ema", "ma", "mm"}, func(selected string) {})
+	changeFilterTypeSelect.SetSelected(state.cfg.Measurement.ChangeFilterType)
+	if changeFilterTypeSelect.Selected == "" {
+		changeFilterTypeSelect.SetSelected("ema") // Default
+	}
+
+	changeFilterAlphaEntry := widget.NewEntry()
+	changeFilterAlphaEntry.SetText(fmt.Sprintf("%.2f", state.cfg.Measurement.ChangeFilterAlpha))
+
+	changeFilterWindowSizeEntry := widget.NewEntry()
+	changeFilterWindowSizeEntry.SetText(state.cfg.Measurement.ChangeFilterWindowSize.String())
 
 	form := &widget.Form{
 		Items: []*widget.FormItem{
 			{Text: "Window (seconds)", Widget: windowSecondsEntry},
-			{Text: "Pulse Threshold (V/s)", Widget: pulseThresholdEntry},
+			{Text: "Pulse Threshold (mV/s)", Widget: pulseThresholdEntry},
+			{Text: "Pulse Fit Range (mV/s)", Widget: pulseLineFitRangeEntry},
 			{Text: "Min Pulse Duration (s)", Widget: minPulseDurationEntry},
-			{Text: "Average Samples (0=disabled)", Widget: averageSamplesEntry},
+			{Text: "Smoothing Alpha (0-1, 0=disabled)", Widget: smoothingAlphaEntry},
+			{Text: "Spike Filter Window Size (0=disabled)", Widget: spikeFilterWindowSizeEntry},
+			{Text: "Downsample Rate (e.g., 1s, 0s=disabled)", Widget: downsampleRateEntry},
+			{Text: "Change Filter Type (ema/ma/mm)", Widget: changeFilterTypeSelect},
+			{Text: "Change Filter Alpha (0-1, for EMA)", Widget: changeFilterAlphaEntry},
+			{Text: "Change Filter Window Size (for MA/MM)", Widget: changeFilterWindowSizeEntry},
 		},
 		OnSubmit: func() {
 			if ws, err := strconv.ParseFloat(windowSecondsEntry.Text, 64); err == nil {
 				state.cfg.Measurement.WindowSeconds = ws
 			}
 			if pt, err := strconv.ParseFloat(pulseThresholdEntry.Text, 64); err == nil {
-				state.cfg.Measurement.PulseThreshold = pt
+				state.cfg.Measurement.PulseThresholdMVS = pt
+			}
+			if plr, err := strconv.ParseFloat(pulseLineFitRangeEntry.Text, 64); err == nil {
+				state.cfg.Measurement.PulseLineFitRangeMVS = plr
 			}
 			if mpd, err := strconv.ParseFloat(minPulseDurationEntry.Text, 64); err == nil {
 				state.cfg.Measurement.MinPulseDuration = mpd
 			}
-			if avg, err := strconv.Atoi(averageSamplesEntry.Text); err == nil {
-				state.cfg.Measurement.AverageSamples = avg
+			if sa, err := strconv.ParseFloat(smoothingAlphaEntry.Text, 64); err == nil {
+				state.cfg.Measurement.SmoothingAlpha = sa
+			}
+			if sfws, err := time.ParseDuration(spikeFilterWindowSizeEntry.Text); err == nil {
+				state.cfg.Measurement.SpikeFilterWindowSize = sfws
+			}
+			if dsr, err := time.ParseDuration(downsampleRateEntry.Text); err == nil {
+				state.cfg.Measurement.DownsampleRate = &dsr
+			}
+			if changeFilterTypeSelect.Selected != "" {
+				state.cfg.Measurement.ChangeFilterType = changeFilterTypeSelect.Selected
+			}
+			if cfa, err := strconv.ParseFloat(changeFilterAlphaEntry.Text, 64); err == nil {
+				state.cfg.Measurement.ChangeFilterAlpha = cfa
+			}
+			if cfws, err := time.ParseDuration(changeFilterWindowSizeEntry.Text); err == nil {
+				state.cfg.Measurement.ChangeFilterWindowSize = cfws
 			}
 			if err := state.cfg.Save("config.yaml"); err != nil {
 				dialog.ShowError(fmt.Errorf("failed to save config: %w", err), state.window)
 			}
 			// Recreate power meter with new config
 			state.powerMeter = meter.New(state.cfg)
+			// Restart measurement chain with new settings
+			if state.chain != nil {
+				closeMeasurementChain(state.chain)
+				state.chain = nil
+				if state.device != nil && state.device.IsConnected() {
+					handleConnect(state)
+				}
+			}
 		},
 	}
 
@@ -273,7 +332,50 @@ func createCalibrationTab(state *appState) *container.TabItem {
 		},
 	}
 
-	return container.NewTabItem("Calibration", form)
+	// Create calibration points list
+	pointsText := ""
+	for i, point := range state.cfg.Calibration.Points {
+		pointsText += fmt.Sprintf("%d. Heater: %.3f mW, Slope: %.6f V/s (%.3f mV/s)\n",
+			i+1, point.Power, point.Slope, point.Slope*1000)
+	}
+	if pointsText == "" {
+		pointsText = "No calibration points yet. Use 'Add Cal Point' button to add points."
+	}
+
+	pointsLabel := widget.NewLabel(pointsText)
+	pointsLabel.Wrapping = fyne.TextWrapWord
+
+	// Create calibrate button
+	calibrateBtn := widget.NewButton("Calibrate (Fit Polynomial)", func() {
+		handleCalibrate(state)
+	})
+
+	// Create clear points button
+	clearPointsBtn := widget.NewButton("Clear All Points", func() {
+		dialog.ShowConfirm("Clear Calibration Points",
+			"Are you sure you want to clear all calibration points?",
+			func(confirmed bool) {
+				if confirmed {
+					state.cfg.Calibration.Points = []config.CalibrationPoint{}
+					if err := state.cfg.Save("config.yaml"); err != nil {
+						dialog.ShowError(fmt.Errorf("failed to save config: %w", err), state.window)
+					} else {
+						dialog.ShowInformation("Success", "All calibration points cleared.", state.window)
+					}
+				}
+			}, state.window)
+	})
+
+	// Layout
+	content := container.NewVBox(
+		form,
+		widget.NewSeparator(),
+		widget.NewLabel("Calibration Points:"),
+		pointsLabel,
+		container.NewHBox(calibrateBtn, clearPointsBtn),
+	)
+
+	return container.NewTabItem("Calibration", content)
 }
 
 // createMockTab creates the Mock device configuration tab.

@@ -104,9 +104,17 @@ func averageAndConvertSamples(samples []lpm.RawSample, cfg *config.Config) (Samp
 
 // NewAveragingConverterForSamples creates an averaging converter that works on already-converted Samples.
 // This is useful when you want to average after conversion.
-func NewAveragingConverterForSamples(windowSize int, bufSize int) func(in <-chan Sample) <-chan Sample {
+//
+// fields specifies which fields to apply averaging to (FieldReading, FieldChange, FieldVoltage, FieldHeaterPower).
+// Multiple fields can be combined with bitwise OR (e.g., FieldReading|FieldChange).
+// If fields is 0, defaults to FieldReading|FieldVoltage|FieldHeaterPower (for backward compatibility).
+func NewAveragingConverterForSamples(windowSize int, fields FieldFlags, bufSize int) func(in <-chan Sample) <-chan Sample {
 	if windowSize <= 0 {
 		windowSize = 1
+	}
+	// Default fields for backward compatibility
+	if fields == 0 {
+		fields = FieldReading | FieldVoltage | FieldHeaterPower
 	}
 	if bufSize <= 0 {
 		bufSize = 100
@@ -127,7 +135,7 @@ func NewAveragingConverterForSamples(windowSize int, bufSize int) func(in <-chan
 				case sample, ok := <-in:
 					if !ok {
 						if len(buffer) > 0 {
-							avg := averageConvertedSamples(buffer)
+							avg := averageConvertedSamples(buffer, fields)
 							select {
 							case out <- avg:
 							default:
@@ -143,7 +151,7 @@ func NewAveragingConverterForSamples(windowSize int, bufSize int) func(in <-chan
 
 				case <-ticker.C:
 					if len(buffer) > 0 {
-						avg := averageConvertedSamples(buffer)
+						avg := averageConvertedSamples(buffer, fields)
 						select {
 						case out <- avg:
 						default:
@@ -159,25 +167,54 @@ func NewAveragingConverterForSamples(windowSize int, bufSize int) func(in <-chan
 }
 
 // averageConvertedSamples averages a slice of converted Samples.
-func averageConvertedSamples(samples []Sample) Sample {
+// Only averages fields specified in the fields parameter.
+// If fields is 0, defaults to FieldReading|FieldVoltage|FieldHeaterPower (for backward compatibility).
+func averageConvertedSamples(samples []Sample, fields FieldFlags) Sample {
 	if len(samples) == 0 {
 		return Sample{}
 	}
 
-	var sumReading, sumVoltage, sumPower float64
+	// Default fields for backward compatibility
+	if fields == 0 {
+		fields = FieldReading | FieldVoltage | FieldHeaterPower
+	}
+
+	var sumReading, sumChange, sumVoltage, sumPower float64
 	lastSample := samples[len(samples)-1]
 
 	for _, s := range samples {
 		sumReading += s.Reading
+		sumChange += s.Change
 		sumVoltage += s.Voltage
 		sumPower += s.HeaterPower
 	}
 
 	n := float64(len(samples))
-	return Sample{
-		Timestamp:   lastSample.Timestamp,
-		Reading:     sumReading / n,
-		Voltage:     sumVoltage / n,
-		HeaterPower: sumPower / n,
+	result := Sample{
+		Timestamp: lastSample.Timestamp,
 	}
+
+	// Only average specified fields, copy others from last sample
+	if HasField(fields, FieldReading) {
+		result.Reading = sumReading / n
+	} else {
+		result.Reading = lastSample.Reading
+	}
+	if HasField(fields, FieldChange) {
+		result.Change = sumChange / n
+	} else {
+		result.Change = lastSample.Change
+	}
+	if HasField(fields, FieldVoltage) {
+		result.Voltage = sumVoltage / n
+	} else {
+		result.Voltage = lastSample.Voltage
+	}
+	if HasField(fields, FieldHeaterPower) {
+		result.HeaterPower = sumPower / n
+	} else {
+		result.HeaterPower = lastSample.HeaterPower
+	}
+
+	return result
 }

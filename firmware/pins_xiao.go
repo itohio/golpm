@@ -1,3 +1,5 @@
+//go:build xiao
+
 package main
 
 import "machine"
@@ -28,4 +30,8 @@ const (
 	// UART 8N1: 10 bits/byte = 15,000 baud minimum. With 3x headroom: 45,000 baud minimum
 	// 115200 provides ~7.7x headroom (11,520 bytes/sec max / 1,500 bytes/sec required)
 	UART_BAUD_RATE = 115200
+)
+
+var (
+	uart = machine.DefaultUART
 )

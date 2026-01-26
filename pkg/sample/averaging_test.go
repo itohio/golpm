@@ -221,7 +221,7 @@ func TestAverageAndConvertSamples(t *testing.T) {
 }
 
 func TestNewAveragingConverterForSamples(t *testing.T) {
-	converter := NewAveragingConverterForSamples(3, 10)
+	converter := NewAveragingConverterForSamples(3, 0, 10) // Use 0 for default fields
 
 	in := make(chan Sample, 10)
 	out := converter(in)
@@ -319,12 +319,17 @@ func TestAverageConvertedSamples(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := averageConvertedSamples(tt.samples)
+			// Use default fields (excludes Change) for backward compatibility
+			got := averageConvertedSamples(tt.samples, 0)
 			if len(tt.samples) == 0 {
 				assert.Equal(t, tt.want, got)
 			} else {
 				assert.Equal(t, tt.want.Timestamp, got.Timestamp)
 				assert.InDelta(t, tt.want.Reading, got.Reading, 0.001)
+				// Change is not averaged when fields=0 (default), so it should be from last sample
+				if len(tt.samples) > 0 {
+					assert.Equal(t, tt.samples[len(tt.samples)-1].Change, got.Change)
+				}
 				assert.InDelta(t, tt.want.Voltage, got.Voltage, 0.001)
 				assert.InDelta(t, tt.want.HeaterPower, got.HeaterPower, 0.0001)
 			}

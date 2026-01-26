@@ -46,17 +46,20 @@ func TestDownsampleSamples_WithDownsampling(t *testing.T) {
 		}
 	}
 
-	// Downsample to 10 points
+	// Downsample to 10 points (now uses averaging, not decimation)
 	dst := make([]Sample, 0, 20)
 	result := DownsampleSamples(dst, samples, 10)
 	require.Equal(t, 10, len(result))
 	
-	// Should always include first sample
-	assert.Equal(t, samples[0], result[0])
+	// First result should be average of first window (samples 0-9)
+	// Average of 0.00, 0.01, ..., 0.09 = (0.00 + 0.09) * 10 / 2 / 10 = 0.045
+	assert.InDelta(t, 0.045, result[0].Reading, 0.01)
+	assert.Equal(t, samples[9].Timestamp, result[0].Timestamp) // Last sample in first window
 	
-	// Last sample should be close to the end (may not be exactly samples[99] due to decimation)
-	// Check that we got samples from across the range
-	assert.GreaterOrEqual(t, result[len(result)-1].Reading, 0.8) // Should be in last 20% of range
+	// Last sample should be average of last window (samples 90-99)
+	// Average of 0.90, 0.91, ..., 0.99 = (0.90 + 0.99) * 10 / 2 / 10 = 0.945
+	assert.InDelta(t, 0.945, result[len(result)-1].Reading, 0.01)
+	assert.Equal(t, samples[99].Timestamp, result[len(result)-1].Timestamp) // Last sample in last window
 	
 	// Should reuse dst if capacity sufficient
 	assert.GreaterOrEqual(t, cap(result), 10)

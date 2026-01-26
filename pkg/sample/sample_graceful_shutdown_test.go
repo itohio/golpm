@@ -95,7 +95,7 @@ func TestConverter_GracefulShutdown(t *testing.T) {
 // TestAveragingConverter_GracefulShutdown tests that averaging converter
 // closes output channel when input channel is closed.
 func TestAveragingConverter_GracefulShutdown(t *testing.T) {
-	converter := NewAveragingConverterForSamples(3, 10)
+	converter := NewAveragingConverterForSamples(3, 0, 10) // Use 0 for default fields
 	input := make(chan Sample, 10)
 	output := converter(input)
 

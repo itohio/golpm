@@ -25,25 +25,25 @@ func TestADCToVoltage(t *testing.T) {
 		},
 		{
 			name: "max ADC",
-			adc:  4095,
+			adc:  65535,
 			vref: 3.3,
 			want: 3.3,
 		},
 		{
 			name: "half ADC",
-			adc:  2047,
+			adc:  32767,
 			vref: 3.3,
 			want: 1.65, // Approximately
 		},
 		{
 			name: "quarter ADC",
-			adc:  1024,
+			adc:  16384,
 			vref: 3.3,
 			want: 0.825, // Approximately
 		},
 		{
 			name: "different VRef",
-			adc:  2047,
+			adc:  32767,
 			vref: 5.0,
 			want: 2.5, // Approximately
 		},
@@ -231,8 +231,8 @@ func TestConvertSample(t *testing.T) {
 			name: "max ADC values, no heaters",
 			raw: lpm.RawSample{
 				Timestamp: now,
-				Reading:   4095,
-				Voltage:   4095,
+				Reading:   65535,
+				Voltage:   65535,
 				Heater1:   false,
 				Heater2:   false,
 				Heater3:   false,
@@ -248,8 +248,8 @@ func TestConvertSample(t *testing.T) {
 			name: "half ADC, heater 1 on",
 			raw: lpm.RawSample{
 				Timestamp: now,
-				Reading:   2047,
-				Voltage:   2047,
+				Reading:   32767,
+				Voltage:   32767,
 				Heater1:   true,
 				Heater2:   false,
 				Heater3:   false,

@@ -57,11 +57,11 @@ func TestParseLine(t *testing.T) {
 		},
 		{
 			name: "valid line - max ADC values",
-			line: "1234567890123,4095,4095,010",
+			line: "1234567890123,65535,65535,010",
 			want: RawSample{
 				Timestamp: time.Unix(0, 1234567890123*1000),
-				Reading:   4095,
-				Voltage:   4095,
+				Reading:   65535,
+				Voltage:   65535,
 				Heater1:   false,
 				Heater2:   true,
 				Heater3:   false,
@@ -90,12 +90,12 @@ func TestParseLine(t *testing.T) {
 		},
 		{
 			name:    "invalid - reading out of range",
-			line:    "1234567890123,5000,1024,101",
+			line:    "1234567890123,70000,1024,101",
 			wantErr: true,
 		},
 		{
 			name:    "invalid - voltage out of range",
-			line:    "1234567890123,2048,5000,101",
+			line:    "1234567890123,2048,70000,101",
 			wantErr: true,
 		},
 		{

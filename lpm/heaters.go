@@ -58,10 +58,19 @@ func updateHeaterStatesFromSample(state *appState, sample lpm.RawSample) {
 }
 
 // updateHeaterButtonStates updates the visual state of heater buttons.
+// Also controls visibility of "Add Cal Point" button - only visible when at least one heater is on.
 func updateHeaterButtonStates(state *appState) {
 	updateHeaterButton(state.heater1Btn, state.heaterState[0])
 	updateHeaterButton(state.heater2Btn, state.heaterState[1])
 	updateHeaterButton(state.heater3Btn, state.heaterState[2])
+
+	// Show "Add Cal Point" button only when at least one heater is on
+	anyHeaterOn := state.heaterState[0] || state.heaterState[1] || state.heaterState[2]
+	if anyHeaterOn {
+		state.addCalPointBtn.Show()
+	} else {
+		state.addCalPointBtn.Hide()
+	}
 }
 
 // updateHeaterButton updates a single heater button's visual state.
@@ -72,4 +81,64 @@ func updateHeaterButton(btn *widget.Button, isOn bool) {
 		btn.Importance = widget.MediumImportance
 	}
 	btn.Refresh()
+}
+
+// handleHeaterIncrement increments heaters as a binary counter.
+// Binary progression: 000 -> 100 -> 010 -> 110 -> 001 -> 101 -> 011 -> 111 -> 000
+// This is equivalent to treating heaters as bits: [H1=bit0, H2=bit1, H3=bit2]
+func handleHeaterIncrement(state *appState) {
+	if state.device == nil || !state.device.IsConnected() {
+		return
+	}
+
+	// Convert current state to binary number (H1=bit0, H2=bit1, H3=bit2)
+	currentValue := 0
+	if state.heaterState[0] {
+		currentValue |= 1 // bit 0
+	}
+	if state.heaterState[1] {
+		currentValue |= 2 // bit 1
+	}
+	if state.heaterState[2] {
+		currentValue |= 4 // bit 2
+	}
+
+	// Increment and wrap around (0-7)
+	nextValue := (currentValue + 1) % 8
+
+	// Convert back to boolean array
+	newState := [3]bool{
+		(nextValue & 1) != 0, // bit 0 -> H1
+		(nextValue & 2) != 0, // bit 1 -> H2
+		(nextValue & 4) != 0, // bit 2 -> H3
+	}
+
+	// Send command to device
+	err := state.device.SetHeaters(newState[0], newState[1], newState[2])
+	if err != nil {
+		dialog.ShowError(fmt.Errorf("failed to increment heaters: %w", err), state.window)
+		return
+	}
+
+	// Update state (optimistic update)
+	state.heaterState = newState
+	updateHeaterButtonStates(state)
+}
+
+// handleHeaterOff turns off all heaters immediately.
+func handleHeaterOff(state *appState) {
+	if state.device == nil || !state.device.IsConnected() {
+		return
+	}
+
+	// Turn off all heaters
+	err := state.device.SetHeaters(false, false, false)
+	if err != nil {
+		dialog.ShowError(fmt.Errorf("failed to turn off heaters: %w", err), state.window)
+		return
+	}
+
+	// Update state (optimistic update)
+	state.heaterState = [3]bool{false, false, false}
+	updateHeaterButtonStates(state)
 }

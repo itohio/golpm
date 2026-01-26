@@ -18,12 +18,26 @@ func TestDerivativeCorrespondence(t *testing.T) {
 	now := time.Now()
 	dt := 100 * time.Millisecond
 
-	// Create samples with known values
+	// Create samples with known values (Change field must be calculated)
 	samples := []sample.Sample{
-		{Timestamp: now, Reading: 1.0, Voltage: 2.0, HeaterPower: 0.0},
-		{Timestamp: now.Add(dt), Reading: 1.1, Voltage: 2.0, HeaterPower: 0.0}, // +0.1V in 0.1s = 1.0 V/s
-		{Timestamp: now.Add(2 * dt), Reading: 1.2, Voltage: 2.0, HeaterPower: 0.0}, // +0.1V in 0.1s = 1.0 V/s
-		{Timestamp: now.Add(3 * dt), Reading: 1.3, Voltage: 2.0, HeaterPower: 0.0}, // +0.1V in 0.1s = 1.0 V/s
+		{Timestamp: now, Reading: 1.0, Change: 0.0, Voltage: 2.0, HeaterPower: 0.0}, // First sample: Change = 0
+	}
+	// Calculate Change for subsequent samples
+	prevReading := 1.0
+	prevTime := now
+	for i := 1; i <= 3; i++ {
+		currTime := now.Add(time.Duration(i) * dt)
+		currReading := 1.0 + float64(i)*0.1
+		change := (currReading - prevReading) / currTime.Sub(prevTime).Seconds()
+		samples = append(samples, sample.Sample{
+			Timestamp:   currTime,
+			Reading:     currReading,
+			Change:     change, // +0.1V in 0.1s = 1.0 V/s
+			Voltage:     2.0,
+			HeaterPower: 0.0,
+		})
+		prevReading = currReading
+		prevTime = currTime
 	}
 
 	for _, s := range samples {
@@ -53,17 +67,31 @@ func TestTimestampBasedRemoval(t *testing.T) {
 
 	now := time.Now()
 
-	// Add samples at different times
+	// Add samples at different times (Change field must be calculated)
 	// Sample at t=0s (will be removed when we add sample at t=1.5s)
-	s1 := sample.Sample{Timestamp: now, Reading: 1.0, Voltage: 2.0, HeaterPower: 0.0}
+	s1 := sample.Sample{Timestamp: now, Reading: 1.0, Change: 0.0, Voltage: 2.0, HeaterPower: 0.0}
 	m.processSample(s1)
 
 	// Sample at t=0.5s (will be kept when we add sample at t=1.5s)
-	s2 := sample.Sample{Timestamp: now.Add(500 * time.Millisecond), Reading: 1.1, Voltage: 2.0, HeaterPower: 0.0}
+	dt1 := 500 * time.Millisecond
+	s2 := sample.Sample{
+		Timestamp:   now.Add(dt1),
+		Reading:     1.1,
+		Change:      (1.1 - 1.0) / dt1.Seconds(),
+		Voltage:     2.0,
+		HeaterPower: 0.0,
+	}
 	m.processSample(s2)
 
 	// Sample at t=1.5s (outside window from s1's perspective, but within window from s2's)
-	s3 := sample.Sample{Timestamp: now.Add(1500 * time.Millisecond), Reading: 1.2, Voltage: 2.0, HeaterPower: 0.0}
+	dt2 := 1500 * time.Millisecond
+	s3 := sample.Sample{
+		Timestamp:   now.Add(dt2),
+		Reading:     1.2,
+		Change:      (1.2 - 1.1) / (dt2 - dt1).Seconds(),
+		Voltage:     2.0,
+		HeaterPower: 0.0,
+	}
 	m.processSample(s3)
 
 	// Verify s1 was removed (outside 1s window from s3)
@@ -89,14 +117,10 @@ func TestDerivativeCorrespondenceAfterRemoval(t *testing.T) {
 	now := time.Now()
 	dt := 200 * time.Millisecond
 
-	// Create 5 samples
-	for i := 0; i < 5; i++ {
-		s := sample.Sample{
-			Timestamp:   now.Add(time.Duration(i) * dt),
-			Reading:     1.0 + float64(i)*0.1,
-			Voltage:     2.0,
-			HeaterPower: 0.0,
-		}
+	// Create 5 samples with Change calculated
+	readings := []float64{1.0, 1.1, 1.2, 1.3, 1.4}
+	samples := createSamplesWithChange(now, readings, 2.0, 0.0, dt)
+	for _, s := range samples {
 		m.processSample(s)
 	}
 
@@ -108,12 +132,8 @@ func TestDerivativeCorrespondenceAfterRemoval(t *testing.T) {
 
 	// Add a sample that will cause removal of first 2 samples (outside 2s window)
 	// First sample is at t=0, new sample at t=2.5s, so samples before t=0.5s are removed
-	s6 := sample.Sample{
-		Timestamp:   now.Add(2500 * time.Millisecond),
-		Reading:     1.5,
-		Voltage:     2.0,
-		HeaterPower: 0.0,
-	}
+	lastSample := samples[len(samples)-1]
+	s6 := createSampleWithChange(now.Add(2500*time.Millisecond), 1.5, 2.0, 0.0, &lastSample)
 	m.processSample(s6)
 
 	// Verify samples were removed based on timestamp

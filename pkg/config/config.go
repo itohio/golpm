@@ -37,10 +37,22 @@ type HeaterConfig struct {
 
 // MeasurementConfig contains measurement parameters.
 type MeasurementConfig struct {
-	WindowSeconds    float64 `yaml:"window_seconds"`
-	PulseThreshold   float64 `yaml:"pulse_threshold"`
-	MinPulseDuration float64 `yaml:"min_pulse_duration"` // Minimum pulse duration in seconds (filters noise)
-	AverageSamples   int     `yaml:"average_samples"`    // Number of samples to average (0 = disabled, default)
+	WindowSeconds         float64        `yaml:"window_seconds"`
+	PulseThresholdMVS     float64        `yaml:"pulse_threshold_mvs"`      // Threshold for pulse detection in mV/s (default: 0.5 mV/s)
+	MinPulseDuration      float64        `yaml:"min_pulse_duration"`       // Minimum pulse duration in seconds (filters noise)
+	SmoothingAlpha        float64        `yaml:"smoothing_alpha"`          // EMA smoothing factor for main fields (0.0-1.0, 0 = disabled, default 0.25)
+	SpikeFilterWindowSize time.Duration  `yaml:"spike_filter_window_size"` // Median filter time window to remove hardware-induced spikes (default: 60ms, 0 = disabled)
+	DownsampleRate        *time.Duration `yaml:"downsample_rate"`          // Target sample rate for downsampling (e.g., "1s" = 1 sample per second, nil = use default, 0 = disabled)
+	// Change field filtering (separate from main smoothing)
+	ChangeFilterType       string        `yaml:"change_filter_type"`        // Filter type for Change field: "ema", "ma", or "mm" (default: "ema")
+	ChangeFilterAlpha      float64       `yaml:"change_filter_alpha"`       // EMA smoothing factor for Change field (0.0-1.0, used when change_filter_type="ema", default 0.25)
+	ChangeFilterWindowSize time.Duration `yaml:"change_filter_window_size"` // Time window for MA/MM filters on Change field (used when change_filter_type="ma" or "mm", default: 200ms)
+	// Pulse detection using horizontal line fitting
+	PulseLineFitMinDuration float64 `yaml:"pulse_line_fit_min_duration"` // Not used in simplified algorithm (kept for compatibility)
+	PulseLineFitRangeMVS    float64 `yaml:"pulse_line_fit_range_mvs"`    // Display threshold for stdDev in mV/s (for reference, not used for rejection)
+	// Power calculation from slope
+	AbsorbanceCoefficient float64   `yaml:"absorbance_coefficient"` // Absorbance coefficient for reflection correction (<1, default: 0.9)
+	PowerPolynomial       []float64 `yaml:"power_polynomial"`       // Polynomial coefficients for power calculation [c0, c1, c2, c3] where Power = c0 + c1*slope + c2*slope² + c3*slope³
 }
 
 // CalibrationConfig contains calibration parameters and points.
@@ -80,15 +92,24 @@ func Default() *Config {
 			VRef: 3.3,
 		},
 		Heaters: []HeaterConfig{
-			{Resistance: 2300},
-			{Resistance: 500},
-			{Resistance: 200},
+			{Resistance: 2694},
+			{Resistance: 511},
+			{Resistance: 240.8},
 		},
 		Measurement: MeasurementConfig{
-			WindowSeconds:    10,
-			PulseThreshold:   0.001,
-			MinPulseDuration: 1.0, // Filter pulses shorter than 1 second
-			AverageSamples:   0,   // No averaging by default
+			WindowSeconds:           10.0,
+			PulseThresholdMVS:       0.5,                                                         // 0.5 mV/s threshold (based on noise analysis)
+			MinPulseDuration:        1.0,                                                         // Filter pulses shorter than 1 second
+			SmoothingAlpha:          0.25,                                                        // EMA smoothing factor for main fields (0.25 = good balance of smoothness and responsiveness)
+			SpikeFilterWindowSize:   60 * time.Millisecond,                                       // Median filter to remove hardware-induced spikes (60ms = ~3 samples at 50Hz)
+			DownsampleRate:          func() *time.Duration { d := 1 * time.Second; return &d }(), // Target sample rate: 1 sample per second
+			ChangeFilterType:        "ema",                                                       // Default: EMA for Change field
+			ChangeFilterAlpha:       0.25,                                                        // EMA smoothing factor for Change field
+			ChangeFilterWindowSize:  200 * time.Millisecond,                                      // Time window for MA/MM filters on Change field (200ms = ~10 samples at 50Hz)
+			PulseLineFitMinDuration: 1.0,                                                         // Minimum 1 second for horizontal line fit
+			PulseLineFitRangeMVS:    0.5,                                                         // Acceptable range ±0.5 mV/s for horizontal line fit (based on noise ~0.1 mV/s)
+			AbsorbanceCoefficient:   0.90,                                                        // 90% absorbance (10% reflection loss)
+			PowerPolynomial:         []float64{0.0, 1.0, 0.0, 0.0},                               // Default: linear (Power = slope), to be calibrated
 		},
 		Calibration: CalibrationConfig{
 			BaselineDuration: 10 * time.Second,
@@ -173,8 +194,28 @@ func (c *Config) ensureDefaults() {
 	if c.Measurement.WindowSeconds == 0 {
 		c.Measurement.WindowSeconds = def.Measurement.WindowSeconds
 	}
-	if c.Measurement.PulseThreshold == 0 {
-		c.Measurement.PulseThreshold = def.Measurement.PulseThreshold
+	if c.Measurement.PulseThresholdMVS == 0 {
+		c.Measurement.PulseThresholdMVS = def.Measurement.PulseThresholdMVS
+	}
+	if c.Measurement.SmoothingAlpha == 0 {
+		c.Measurement.SmoothingAlpha = def.Measurement.SmoothingAlpha
+	}
+	if c.Measurement.SpikeFilterWindowSize <= 0 {
+		c.Measurement.SpikeFilterWindowSize = def.Measurement.SpikeFilterWindowSize
+	}
+	// DownsampleRate: Use pointer to distinguish "not set" (nil) from "explicitly set to 0"
+	// If nil, set to default. If not nil (even if 0), keep the user's value.
+	if c.Measurement.DownsampleRate == nil {
+		c.Measurement.DownsampleRate = def.Measurement.DownsampleRate
+	}
+	if c.Measurement.ChangeFilterType == "" {
+		c.Measurement.ChangeFilterType = def.Measurement.ChangeFilterType
+	}
+	if c.Measurement.ChangeFilterAlpha == 0 {
+		c.Measurement.ChangeFilterAlpha = def.Measurement.ChangeFilterAlpha
+	}
+	if c.Measurement.ChangeFilterWindowSize <= 0 {
+		c.Measurement.ChangeFilterWindowSize = def.Measurement.ChangeFilterWindowSize
 	}
 
 	if c.Calibration.BaselineDuration == 0 {

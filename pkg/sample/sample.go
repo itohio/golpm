@@ -8,10 +8,27 @@ import (
 	"github.com/itohio/golpm/pkg/lpm"
 )
 
+// FieldFlags is a typed set of flags for filtering operations.
+type FieldFlags uint8
+
+// Field flags for filtering operations
+const (
+	FieldReading     FieldFlags = 1 << iota // Filter on Reading field
+	FieldChange                             // Filter on Change field
+	FieldVoltage                            // Filter on Voltage field
+	FieldHeaterPower                        // Filter on HeaterPower field
+)
+
+// HasField checks if the field flag contains the specified field.
+func HasField(flags FieldFlags, field FieldFlags) bool {
+	return flags&field != 0
+}
+
 // Sample represents a processed measurement sample with physical values.
 type Sample struct {
 	Timestamp   time.Time
 	Reading     float64 // Temperature differential voltage (V)
+	Change      float64 // Change from previous reading (V) - calculated by differentiation filter
 	Voltage     float64 // Voltage measurement (V)
 	HeaterPower float64 // Total heater power (W)
 }
@@ -65,14 +82,16 @@ func convertSample(raw lpm.RawSample, cfg *config.Config) (Sample, error) {
 	return Sample{
 		Timestamp:   raw.Timestamp,
 		Reading:     readingVoltage,
+		Change:      0.0, // Will be calculated by differentiation filter
 		Voltage:     voltageActual,
 		HeaterPower: heaterPower,
 	}, nil
 }
 
-// adcToVoltage converts a 12-bit ADC reading to voltage.
+// adcToVoltage converts a 16-bit ADC reading to voltage.
+// TinyGo's machine.ADC.Get() returns 16-bit values (0-65535) regardless of hardware resolution.
 func adcToVoltage(adc uint16, vref float64) float64 {
-	return (float64(adc) / 4095.0) * vref
+	return (float64(adc) / 65535.0) * vref
 }
 
 // voltageDivider calculates the input voltage from the measured output voltage.

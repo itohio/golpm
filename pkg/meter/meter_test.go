@@ -9,6 +9,42 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// createSampleWithChange creates a sample with Change calculated from previous sample.
+// For the first sample, prev should be nil and Change will be 0.0.
+func createSampleWithChange(timestamp time.Time, reading float64, voltage float64, heaterPower float64, prev *sample.Sample) sample.Sample {
+	s := sample.Sample{
+		Timestamp:   timestamp,
+		Reading:     reading,
+		Voltage:     voltage,
+		HeaterPower: heaterPower,
+	}
+	if prev == nil {
+		s.Change = 0.0 // First sample
+	} else {
+		dt := timestamp.Sub(prev.Timestamp).Seconds()
+		if dt > 0 {
+			s.Change = (reading - prev.Reading) / dt
+		} else {
+			s.Change = 0.0
+		}
+	}
+	return s
+}
+
+// createSamplesWithChange creates a slice of samples with Change calculated automatically.
+// The first sample will have Change = 0.0, subsequent samples will have Change calculated.
+func createSamplesWithChange(baseTime time.Time, readings []float64, voltage float64, heaterPower float64, dt time.Duration) []sample.Sample {
+	if len(readings) == 0 {
+		return nil
+	}
+	samples := make([]sample.Sample, len(readings))
+	samples[0] = createSampleWithChange(baseTime, readings[0], voltage, heaterPower, nil)
+	for i := 1; i < len(readings); i++ {
+		samples[i] = createSampleWithChange(baseTime.Add(time.Duration(i)*dt), readings[i], voltage, heaterPower, &samples[i-1])
+	}
+	return samples
+}
+
 func TestNew(t *testing.T) {
 	cfg := config.Default()
 	m := New(cfg)
@@ -24,12 +60,7 @@ func TestProcessSample_Basic(t *testing.T) {
 	m := New(cfg)
 
 	now := time.Now()
-	s := sample.Sample{
-		Timestamp:   now,
-		Reading:     1.0,
-		Voltage:     2.0,
-		HeaterPower: 0.0,
-	}
+	s := createSampleWithChange(now, 1.0, 2.0, 0.0, nil)
 
 	m.processSample(s)
 
@@ -44,18 +75,9 @@ func TestProcessSample_Differentiation(t *testing.T) {
 	m := New(cfg)
 
 	now := time.Now()
-	s1 := sample.Sample{
-		Timestamp:   now,
-		Reading:     1.0,
-		Voltage:     2.0,
-		HeaterPower: 0.0,
-	}
-	s2 := sample.Sample{
-		Timestamp:   now.Add(100 * time.Millisecond),
-		Reading:     1.1, // 0.1V increase in 0.1s = 1.0 V/s
-		Voltage:     2.0,
-		HeaterPower: 0.0,
-	}
+	s1 := createSampleWithChange(now, 1.0, 2.0, 0.0, nil)
+	dt := 100 * time.Millisecond
+	s2 := createSampleWithChange(now.Add(dt), 1.1, 2.0, 0.0, &s1) // 0.1V increase in 0.1s = 1.0 V/s
 
 	m.processSample(s1)
 	m.processSample(s2)
@@ -71,24 +93,9 @@ func TestProcessSample_WindowRemoval(t *testing.T) {
 	m := New(cfg)
 
 	now := time.Now()
-	s1 := sample.Sample{
-		Timestamp:   now,
-		Reading:     1.0,
-		Voltage:     2.0,
-		HeaterPower: 0.0,
-	}
-	s2 := sample.Sample{
-		Timestamp:   now.Add(500 * time.Millisecond),
-		Reading:     1.1,
-		Voltage:     2.0,
-		HeaterPower: 0.0,
-	}
-	s3 := sample.Sample{
-		Timestamp:   now.Add(1500 * time.Millisecond), // Outside window
-		Reading:     1.2,
-		Voltage:     2.0,
-		HeaterPower: 0.0,
-	}
+	s1 := createSampleWithChange(now, 1.0, 2.0, 0.0, nil)
+	s2 := createSampleWithChange(now.Add(500*time.Millisecond), 1.1, 2.0, 0.0, &s1)
+	s3 := createSampleWithChange(now.Add(1500*time.Millisecond), 1.2, 2.0, 0.0, &s2) // Outside window
 
 	m.processSample(s1)
 	m.processSample(s2)
@@ -101,28 +108,24 @@ func TestProcessSample_WindowRemoval(t *testing.T) {
 
 func TestProcessSample_PulseDetection(t *testing.T) {
 	cfg := config.Default()
-	cfg.Measurement.PulseThreshold = 0.5 // 0.5 V/s threshold
+	cfg.Measurement.PulseThresholdMVS = 500.0 // 500 mV/s threshold (0.5 V/s)
 	cfg.Measurement.MinPulseDuration = 0.1 // Lower threshold for test (0.1s)
+	cfg.Measurement.PulseLineFitMinDuration = 0.1 // Lower threshold for test
+	cfg.Measurement.PulseLineFitRangeMVS = 10.0 // 10 mV/s acceptable range
 	m := New(cfg)
 
 	now := time.Now()
 	dt := 100 * time.Millisecond
 
-	// Create samples with increasing reading (heating) - 12 samples = 1.2s pulse
-	samples := []sample.Sample{
-		{Timestamp: now, Reading: 1.0, Voltage: 2.0, HeaterPower: 0.0},
-		{Timestamp: now.Add(dt), Reading: 1.05, Voltage: 2.0, HeaterPower: 0.0}, // 0.5 V/s
-		{Timestamp: now.Add(2 * dt), Reading: 1.1, Voltage: 2.0, HeaterPower: 0.0},  // 0.5 V/s
-		{Timestamp: now.Add(3 * dt), Reading: 1.15, Voltage: 2.0, HeaterPower: 0.0}, // 0.5 V/s
-		{Timestamp: now.Add(4 * dt), Reading: 1.2, Voltage: 2.0, HeaterPower: 0.0},  // 0.5 V/s
-		{Timestamp: now.Add(5 * dt), Reading: 1.25, Voltage: 2.0, HeaterPower: 0.0},
-		{Timestamp: now.Add(6 * dt), Reading: 1.3, Voltage: 2.0, HeaterPower: 0.0},
-		{Timestamp: now.Add(7 * dt), Reading: 1.35, Voltage: 2.0, HeaterPower: 0.0},
-		{Timestamp: now.Add(8 * dt), Reading: 1.4, Voltage: 2.0, HeaterPower: 0.0},
-		{Timestamp: now.Add(9 * dt), Reading: 1.45, Voltage: 2.0, HeaterPower: 0.0},
-		{Timestamp: now.Add(10 * dt), Reading: 1.5, Voltage: 2.0, HeaterPower: 0.0},
-		{Timestamp: now.Add(11 * dt), Reading: 1.55, Voltage: 2.0, HeaterPower: 0.0},
-	}
+	// Create samples with constant slope (heating) - 12 samples = 1.2s pulse
+	// Use constant slope to ensure good fit
+	readings := []float64{1.0, 1.05, 1.1, 1.15, 1.2, 1.25, 1.3, 1.35, 1.4, 1.45, 1.5, 1.55}
+	samples := createSamplesWithChange(now, readings, 2.0, 0.0, dt)
+	
+	// Add cooling phase (slope drops below threshold)
+	coolingReadings := []float64{1.55, 1.56, 1.57}
+	coolingSamples := createSamplesWithChange(now.Add(time.Duration(len(readings))*dt), coolingReadings, 2.0, 0.0, dt)
+	samples = append(samples, coolingSamples...)
 
 	for _, s := range samples {
 		m.processSample(s)
@@ -136,24 +139,21 @@ func TestProcessSample_PulseDetection(t *testing.T) {
 		assert.GreaterOrEqual(t, pulse.StartIndex, 0)
 		assert.Less(t, pulse.StartIndex, len(m.Samples()))
 		assert.GreaterOrEqual(t, pulse.EndIndex, pulse.StartIndex)
-		assert.Greater(t, pulse.RawValue, cfg.Measurement.PulseThreshold)
+		assert.Greater(t, pulse.AvgSlope, m.threshold) // Compare with internal threshold (V/s)
 	}
 }
 
 func TestProcessSample_PulseDetection_BelowThreshold(t *testing.T) {
 	cfg := config.Default()
-	cfg.Measurement.PulseThreshold = 0.5 // 0.5 V/s threshold
+	cfg.Measurement.PulseThresholdMVS = 500.0 // 500 mV/s threshold (0.5 V/s)
 	m := New(cfg)
 
 	now := time.Now()
 	dt := 100 * time.Millisecond
 
 	// Create samples with slow increase (below threshold)
-	samples := []sample.Sample{
-		{Timestamp: now, Reading: 1.0, Voltage: 2.0, HeaterPower: 0.0},
-		{Timestamp: now.Add(dt), Reading: 1.01, Voltage: 2.0, HeaterPower: 0.0}, // 0.1 V/s
-		{Timestamp: now.Add(2 * dt), Reading: 1.02, Voltage: 2.0, HeaterPower: 0.0}, // 0.1 V/s
-	}
+	readings := []float64{1.0, 1.01, 1.02}
+	samples := createSamplesWithChange(now, readings, 2.0, 0.0, dt)
 
 	for _, s := range samples {
 		m.processSample(s)
@@ -165,8 +165,10 @@ func TestProcessSample_PulseDetection_BelowThreshold(t *testing.T) {
 
 func TestProcessSample_MultiplePulses(t *testing.T) {
 	cfg := config.Default()
-	cfg.Measurement.PulseThreshold = 0.5
+	cfg.Measurement.PulseThresholdMVS = 500.0 // 500 mV/s threshold (0.5 V/s)
 	cfg.Measurement.MinPulseDuration = 0.1 // Lower threshold for test
+	cfg.Measurement.PulseLineFitMinDuration = 0.1 // Lower threshold for test
+	cfg.Measurement.PulseLineFitRangeMVS = 10.0 // 10 mV/s acceptable range
 	cfg.Measurement.WindowSeconds = 10.0 // Large window
 	m := New(cfg)
 
@@ -174,44 +176,35 @@ func TestProcessSample_MultiplePulses(t *testing.T) {
 	dt := 100 * time.Millisecond
 
 	// First pulse: heating (12 samples = 1.2s, above 0.1s minimum)
-	samples1 := []sample.Sample{
-		{Timestamp: now, Reading: 1.0, Voltage: 2.0, HeaterPower: 0.0},
-		{Timestamp: now.Add(dt), Reading: 1.05, Voltage: 2.0, HeaterPower: 0.0},
-		{Timestamp: now.Add(2 * dt), Reading: 1.1, Voltage: 2.0, HeaterPower: 0.0},
-		{Timestamp: now.Add(3 * dt), Reading: 1.15, Voltage: 2.0, HeaterPower: 0.0},
-		{Timestamp: now.Add(4 * dt), Reading: 1.2, Voltage: 2.0, HeaterPower: 0.0},
-		{Timestamp: now.Add(5 * dt), Reading: 1.25, Voltage: 2.0, HeaterPower: 0.0},
-		{Timestamp: now.Add(6 * dt), Reading: 1.3, Voltage: 2.0, HeaterPower: 0.0},
-		{Timestamp: now.Add(7 * dt), Reading: 1.35, Voltage: 2.0, HeaterPower: 0.0},
-		{Timestamp: now.Add(8 * dt), Reading: 1.4, Voltage: 2.0, HeaterPower: 0.0},
-		{Timestamp: now.Add(9 * dt), Reading: 1.45, Voltage: 2.0, HeaterPower: 0.0},
-		{Timestamp: now.Add(10 * dt), Reading: 1.5, Voltage: 2.0, HeaterPower: 0.0},
-		{Timestamp: now.Add(11 * dt), Reading: 1.55, Voltage: 2.0, HeaterPower: 0.0},
-	}
+	readings1 := []float64{1.0, 1.05, 1.1, 1.15, 1.2, 1.25, 1.3, 1.35, 1.4, 1.45, 1.5, 1.55}
+	samples1 := createSamplesWithChange(now, readings1, 2.0, 0.0, dt)
 
-	// Cooling phase (below threshold)
+	// Cooling phase (below threshold) - need to calculate from last sample of samples1
+	lastSample1 := samples1[len(samples1)-1]
+	s2First := createSampleWithChange(now.Add(12*dt), 1.55, 2.0, 0.0, &lastSample1)
 	samples2 := []sample.Sample{
-		{Timestamp: now.Add(12 * dt), Reading: 1.55, Voltage: 2.0, HeaterPower: 0.0},
-		{Timestamp: now.Add(13 * dt), Reading: 1.54, Voltage: 2.0, HeaterPower: 0.0},
+		s2First,
+		createSampleWithChange(now.Add(13*dt), 1.54, 2.0, 0.0, &s2First),
 	}
 
 	// Second pulse: heating again (12 samples = 1.2s)
-	samples3 := []sample.Sample{
-		{Timestamp: now.Add(14 * dt), Reading: 1.54, Voltage: 2.0, HeaterPower: 0.0},
-		{Timestamp: now.Add(15 * dt), Reading: 1.59, Voltage: 2.0, HeaterPower: 0.0},
-		{Timestamp: now.Add(16 * dt), Reading: 1.64, Voltage: 2.0, HeaterPower: 0.0},
-		{Timestamp: now.Add(17 * dt), Reading: 1.69, Voltage: 2.0, HeaterPower: 0.0},
-		{Timestamp: now.Add(18 * dt), Reading: 1.74, Voltage: 2.0, HeaterPower: 0.0},
-		{Timestamp: now.Add(19 * dt), Reading: 1.79, Voltage: 2.0, HeaterPower: 0.0},
-		{Timestamp: now.Add(20 * dt), Reading: 1.84, Voltage: 2.0, HeaterPower: 0.0},
-		{Timestamp: now.Add(21 * dt), Reading: 1.89, Voltage: 2.0, HeaterPower: 0.0},
-		{Timestamp: now.Add(22 * dt), Reading: 1.94, Voltage: 2.0, HeaterPower: 0.0},
-		{Timestamp: now.Add(23 * dt), Reading: 1.99, Voltage: 2.0, HeaterPower: 0.0},
-		{Timestamp: now.Add(24 * dt), Reading: 2.04, Voltage: 2.0, HeaterPower: 0.0},
-		{Timestamp: now.Add(25 * dt), Reading: 2.09, Voltage: 2.0, HeaterPower: 0.0},
+	lastSample2 := samples2[len(samples2)-1]
+	readings3Full := []float64{1.54, 1.59, 1.64, 1.69, 1.74, 1.79, 1.84, 1.89, 1.94, 1.99, 2.04, 2.09}
+	samples3Start := createSampleWithChange(now.Add(14*dt), readings3Full[0], 2.0, 0.0, &lastSample2)
+	samples3 := []sample.Sample{samples3Start}
+	for i := 1; i < len(readings3Full); i++ {
+		samples3 = append(samples3, createSampleWithChange(now.Add(time.Duration(14+i)*dt), readings3Full[i], 2.0, 0.0, &samples3[i-1]))
+	}
+	
+	// Add cooling phase for second pulse
+	lastSample3 := samples3[len(samples3)-1]
+	s4First := createSampleWithChange(now.Add(26*dt), 2.09, 2.0, 0.0, &lastSample3)
+	samples4 := []sample.Sample{
+		s4First,
+		createSampleWithChange(now.Add(27*dt), 2.08, 2.0, 0.0, &s4First),
 	}
 
-	allSamples := append(append(samples1, samples2...), samples3...)
+	allSamples := append(append(append(samples1, samples2...), samples3...), samples4...)
 	for _, s := range allSamples {
 		m.processSample(s)
 	}
@@ -308,7 +301,7 @@ func TestDerivatives_Count(t *testing.T) {
 
 func TestPulses_IndicesValid(t *testing.T) {
 	cfg := config.Default()
-	cfg.Measurement.PulseThreshold = 0.5
+	cfg.Measurement.PulseThresholdMVS = 500.0 // 500 mV/s threshold (0.5 V/s)
 	cfg.Measurement.WindowSeconds = 5.0
 	m := New(cfg)
 

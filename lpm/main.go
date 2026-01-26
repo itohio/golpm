@@ -22,10 +22,10 @@ import (
 
 func main() {
 	var (
-		portFlag           = flag.String("p", "", "Serial port override (e.g., COM3 or /dev/ttyACM0)")
-		configFlag         = flag.String("config", "config.yaml", "Configuration file path")
-		mockFlag           = flag.Bool("mock", false, "Use mocked device instead of serial port")
-		averageSamplesFlag = flag.Int("average-samples", -1, "Number of samples to average (0 = disabled, overrides config)")
+		portFlag       = flag.String("p", "", "Serial port override (e.g., COM3 or /dev/ttyACM0)")
+		configFlag     = flag.String("config", "config.yaml", "Configuration file path")
+		mockFlag       = flag.Bool("mock", false, "Use mocked device instead of serial port")
+		statisticsFlag = flag.Bool("statistics", false, "Calculate and log statistics (variability, stddev, optimal EMA parameters)")
 	)
 	flag.Parse()
 
@@ -38,11 +38,6 @@ func main() {
 	// Override serial port if provided via command line
 	if *portFlag != "" {
 		cfg.Serial.Port = *portFlag
-	}
-
-	// Override average samples if provided via command line
-	if *averageSamplesFlag >= 0 {
-		cfg.Measurement.AverageSamples = *averageSamplesFlag
 	}
 
 	// Create Fyne application
@@ -58,11 +53,12 @@ func main() {
 
 	// Create application state
 	appState := &appState{
-		cfg:        cfg,
-		device:     nil,
-		powerMeter: powerMeter,
-		window:     window,
-		useMock:    *mockFlag,
+		cfg:           cfg,
+		device:        nil,
+		powerMeter:    powerMeter,
+		window:        window,
+		useMock:       *mockFlag,
+		useStatistics: *statisticsFlag,
 	}
 
 	// Create toolbar
@@ -97,18 +93,22 @@ type measurementChain struct {
 
 // appState holds the application state.
 type appState struct {
-	cfg         *config.Config
-	device      lpm.Device
-	powerMeter  *meter.Meter
-	scopeWidget *scope.ScopeWidget
-	window      fyne.Window
-	connectBtn  *widget.Button
-	heater1Btn  *widget.Button
-	heater2Btn  *widget.Button
-	heater3Btn  *widget.Button
-	useMock     bool
-	heaterState [3]bool           // Current heater states [heater1, heater2, heater3]
-	chain       *measurementChain // Current measurement chain (nil if not connected)
+	cfg                *config.Config
+	device             lpm.Device
+	powerMeter         *meter.Meter
+	scopeWidget        *scope.ScopeWidget
+	window             fyne.Window
+	connectBtn         *widget.Button
+	heater1Btn         *widget.Button
+	heater2Btn         *widget.Button
+	heater3Btn         *widget.Button
+	addCalPointBtn     *widget.Button
+	heaterIncrementBtn *widget.Button
+	heaterOffBtn       *widget.Button
+	useMock            bool
+	useStatistics      bool
+	heaterState        [3]bool           // Current heater states [heater1, heater2, heater3]
+	chain              *measurementChain // Current measurement chain (nil if not connected)
 
 	// Throttling for scope updates
 	lastUpdateTime time.Time
@@ -121,6 +121,7 @@ func createToolbar(state *appState) fyne.CanvasObject {
 	connectBtn := widget.NewButtonWithIcon("", theme.LoginIcon(), func() {
 		handleConnect(state)
 	})
+	connectBtn.Importance = widget.HighImportance
 	state.connectBtn = connectBtn
 
 	// Settings button with icon
@@ -128,33 +129,71 @@ func createToolbar(state *appState) fyne.CanvasObject {
 		showSettingsDialog(state)
 	})
 
-	// Create heater buttons with icon (using InfoIcon as placeholder for resistor-like component)
-	// Tooltips would show resistance values, but Fyne buttons don't support tooltips directly
-	// Users can see resistance values in the settings dialog
-	heater1Btn := widget.NewButtonWithIcon("", theme.InfoIcon(), func() {
+	// Create heater buttons with better icons
+	// Using radio button checked/unchecked icons to represent heater state
+	heater1Btn := widget.NewButtonWithIcon("", theme.RadioButtonIcon(), func() {
 		handleHeaterToggle(state, 0)
 	})
 	heater1Btn.Disable()
 	state.heater1Btn = heater1Btn
 
-	heater2Btn := widget.NewButtonWithIcon("", theme.InfoIcon(), func() {
+	heater2Btn := widget.NewButtonWithIcon("", theme.RadioButtonIcon(), func() {
 		handleHeaterToggle(state, 1)
 	})
 	heater2Btn.Disable()
 	state.heater2Btn = heater2Btn
 
-	heater3Btn := widget.NewButtonWithIcon("", theme.InfoIcon(), func() {
+	heater3Btn := widget.NewButtonWithIcon("", theme.RadioButtonIcon(), func() {
 		handleHeaterToggle(state, 2)
 	})
 	heater3Btn.Disable()
 	state.heater3Btn = heater3Btn
 
-	// Create toolbar with buttons on left and heater buttons aligned to the right
+	// Add calibration point button
+	// Only visible when at least one heater is on
+	addCalPointBtn := widget.NewButtonWithIcon("Add Cal Point", theme.ContentAddIcon(), func() {
+		handleAddCalibrationPoint(state)
+	})
+	addCalPointBtn.Disable()
+	addCalPointBtn.Hide() // Start hidden - will be shown when heater is turned on
+	state.addCalPointBtn = addCalPointBtn
+
+	// Heater increment button (binary counter)
+	// Increments heaters as binary: 000 -> 100 -> 010 -> 110 -> 001 -> 101 -> 011 -> 111 -> 000
+	heaterIncrementBtn := widget.NewButtonWithIcon("", theme.MediaFastForwardIcon(), func() {
+		handleHeaterIncrement(state)
+	})
+	heaterIncrementBtn.Disable()
+	state.heaterIncrementBtn = heaterIncrementBtn
+
+	// Heater off button (turn off all heaters)
+	heaterOffBtn := widget.NewButtonWithIcon("", theme.MediaStopIcon(), func() {
+		handleHeaterOff(state)
+	})
+	heaterOffBtn.Disable()
+	heaterOffBtn.Importance = widget.DangerImportance
+	state.heaterOffBtn = heaterOffBtn
+
+	// Create separators
+	separator1 := widget.NewSeparator()
+	separator2 := widget.NewSeparator()
+
+	// Create toolbar with buttons on left and heater controls aligned to the right
+	// Layout: [Connect] [Settings] ... [Add Cal] | [>>] [H1] [H2] [H3] | [Off]
 	return container.NewBorder(
 		nil, // top
 		nil, // bottom
-		container.NewHBox(connectBtn, settingsBtn),            // left
-		container.NewHBox(heater1Btn, heater2Btn, heater3Btn), // right
+		container.NewHBox(connectBtn, settingsBtn), // left
+		container.NewHBox( // right
+			addCalPointBtn,
+			separator1,
+			heaterIncrementBtn,
+			heater1Btn,
+			heater2Btn,
+			heater3Btn,
+			separator2,
+			heaterOffBtn,
+		),
 		nil, // center (spacer)
 	)
 }
@@ -195,6 +234,9 @@ func handleConnect(state *appState) {
 		state.heater1Btn.Disable()
 		state.heater2Btn.Disable()
 		state.heater3Btn.Disable()
+		state.addCalPointBtn.Disable()
+		state.heaterIncrementBtn.Disable()
+		state.heaterOffBtn.Disable()
 		// Reset heater states
 		state.heaterState = [3]bool{false, false, false}
 		updateHeaterButtonStates(state)
@@ -232,6 +274,9 @@ func handleConnect(state *appState) {
 		state.heater1Btn.Enable()
 		state.heater2Btn.Enable()
 		state.heater3Btn.Enable()
+		state.addCalPointBtn.Enable()
+		state.heaterIncrementBtn.Enable()
+		state.heaterOffBtn.Enable()
 
 		// Reset meter shutdown flag for new chain
 		state.powerMeter.ResetShutdown()
@@ -291,18 +336,97 @@ func handleConnect(state *appState) {
 			}
 		}()
 
-		// Chain converters: base converter always used, averaging converter conditionally
-		// If average_samples is 0, skip averaging; if > 0, chain averaging converter
+		// Chain converters:
+		// 1. Base conversion from raw samples
+		// 2. Statistics collection (if enabled) - collects stats on raw converted samples
+		// 3. Median filter on main fields to remove spikes (hardware-induced spikes when heaters turn on)
+		// 4. EMA smoothing on all fields except Change (if smoothing enabled)
+		// 5. Downsampling to target sample rate (if enabled)
+		// 6. Differentiation to calculate Change field from Reading
+		// 7. Filter on Change field (EMA/MA/MM - configurable)
 		// Increase buffer size to prevent channel full errors
 		baseStream := sample.NewConverter(state.cfg, 500)(rawSamplesForConverter)
 
-		var samplesStream <-chan sample.Sample
-		if state.cfg.Measurement.AverageSamples > 0 {
-			// Chain averaging converter when enabled (for already-converted samples)
-			samplesStream = sample.NewAveragingConverterForSamples(state.cfg.Measurement.AverageSamples, 500)(baseStream)
+		// Apply statistics collection (if enabled)
+		// This must be done BEFORE any filtering to capture raw signal characteristics
+		var statsStream <-chan sample.Sample
+		if state.useStatistics {
+			// Use the configured smoothing alpha for EMA comparison
+			log.Printf("Statistics Smoothing alpha: %f", state.cfg.Measurement.SmoothingAlpha)
+			statsStream = sample.NewStatisticsConverter(state.cfg.Measurement.SmoothingAlpha, 500)(baseStream)
 		} else {
-			// No averaging, use base stream directly
-			samplesStream = baseStream
+			statsStream = baseStream
+		}
+
+		// Apply median filter to remove spikes from main signal (Reading, Voltage)
+		// This filters out hardware-induced spikes when heaters turn on
+		// Note: HeaterPower is never filtered - it's only calculated
+		mainFields := sample.FieldReading | sample.FieldVoltage
+		var spikeFilteredStream <-chan sample.Sample
+		if state.cfg.Measurement.SpikeFilterWindowSize > 0 {
+			spikeFilteredStream = sample.NewMMFilter(state.cfg.Measurement.SpikeFilterWindowSize, mainFields, 500)(statsStream)
+		} else {
+			// Spike filtering disabled, use stats stream directly
+			spikeFilteredStream = statsStream
+		}
+
+		// Apply EMA smoothing on all fields except Change and HeaterPower (if smoothing enabled)
+		// Note: HeaterPower is never filtered - it's only calculated
+		var smoothedStream <-chan sample.Sample
+		if state.cfg.Measurement.SmoothingAlpha > 0 {
+			// Apply EMA to Reading and Voltage (Change will be calculated later, HeaterPower is never filtered)
+			smoothedStream = sample.NewEMAFilter(state.cfg.Measurement.SmoothingAlpha, mainFields, 500)(spikeFilteredStream)
+		} else {
+			// No smoothing, use spike-filtered stream directly
+			smoothedStream = spikeFilteredStream
+		}
+
+		// Apply downsampling to target sample rate (if enabled)
+		var downsampledStream <-chan sample.Sample
+		if state.cfg.Measurement.DownsampleRate != nil && *state.cfg.Measurement.DownsampleRate > 0 {
+			downsampledStream = sample.NewDownsamplingConverter(*state.cfg.Measurement.DownsampleRate, 500)(smoothedStream)
+		} else {
+			// No downsampling, use smoothed stream directly
+			downsampledStream = smoothedStream
+		}
+
+		// Always apply differentiation to calculate Change field from Reading
+		diffStream := sample.NewDifferentiationConverter(500)(downsampledStream)
+
+		// Apply filter on Change field (configurable: EMA, MA, or MM)
+		var samplesStream <-chan sample.Sample
+		changeFields := sample.FieldChange
+		filterType := state.cfg.Measurement.ChangeFilterType
+		if filterType == "" {
+			filterType = "ema" // Default
+		}
+
+		switch filterType {
+		case "ema", "EMA":
+			if state.cfg.Measurement.ChangeFilterAlpha > 0 {
+				samplesStream = sample.NewEMAFilter(state.cfg.Measurement.ChangeFilterAlpha, changeFields, 500)(diffStream)
+			} else {
+				samplesStream = diffStream // No filtering if alpha is 0
+			}
+		case "ma", "MA":
+			windowDuration := state.cfg.Measurement.ChangeFilterWindowSize
+			if windowDuration <= 0 {
+				windowDuration = 200 * time.Millisecond // Default: 200ms
+			}
+			samplesStream = sample.NewMAFilter(windowDuration, changeFields, 500)(diffStream)
+		case "mm", "MM":
+			windowDuration := state.cfg.Measurement.ChangeFilterWindowSize
+			if windowDuration <= 0 {
+				windowDuration = 200 * time.Millisecond // Default: 200ms
+			}
+			samplesStream = sample.NewMMFilter(windowDuration, changeFields, 500)(diffStream)
+		default:
+			// Unknown filter type, use EMA as fallback
+			if state.cfg.Measurement.ChangeFilterAlpha > 0 {
+				samplesStream = sample.NewEMAFilter(state.cfg.Measurement.ChangeFilterAlpha, changeFields, 500)(diffStream)
+			} else {
+				samplesStream = diffStream
+			}
 		}
 
 		// Process samples through power meter (starts measurement automatically)

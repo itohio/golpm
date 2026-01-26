@@ -43,7 +43,7 @@ func NewMock(cfg *config.MockConfig) *Mock {
 			Bias:          0.0,
 			NoiseLevel:    0.001,
 			LaserPower:    40.0,
-			LaserDuration: 2 * time.Second,
+			LaserDuration: 10 * time.Second,
 			LaserPeriod:   20 * time.Second,
 			SampleRate:    20 * time.Millisecond, // 50 samples per second
 		}
@@ -73,7 +73,7 @@ func (m *Mock) Connect() error {
 	m.startTime = time.Now()
 	m.lastLaserOn = m.startTime
 	m.temperature = m.cfg.Bias
-	m.voltage = 0.0
+	m.voltage = 5 // Initial voltage (will have noise added)
 
 	// Start generating samples
 	go m.generateSamples()
@@ -159,25 +159,21 @@ func (m *Mock) generateSample() RawSample {
 	m.mu.RUnlock()
 
 	// Check if laser should be on
-	laserActive := false
+	// Laser cycles: on for LaserDuration, off for (LaserPeriod - LaserDuration)
+	// Reset timer when period completes
 	if laserElapsed >= m.cfg.LaserPeriod {
-		// Time for next laser pulse
-		laserActive = true
 		m.mu.Lock()
 		m.lastLaserOn = now
-		m.laserActive = true
 		m.mu.Unlock()
-	} else if laserElapsed < m.cfg.LaserDuration {
-		// Laser is still on
-		laserActive = true
-		m.mu.Lock()
-		m.laserActive = true
-		m.mu.Unlock()
-	} else {
-		m.mu.Lock()
-		m.laserActive = false
-		m.mu.Unlock()
+		laserElapsed = 0 // Reset for new cycle
 	}
+
+	// Laser is on during the first LaserDuration of each period
+	laserActive := laserElapsed < m.cfg.LaserDuration
+
+	m.mu.Lock()
+	m.laserActive = laserActive
+	m.mu.Unlock()
 
 	// Simulate temperature response
 	// Heating from laser or heaters
@@ -188,10 +184,12 @@ func (m *Mock) generateSample() RawSample {
 	}
 
 	// Thermal response: exponential approach to steady state
+	// Each heater adds its power contribution to temperature
 	// Simplified model: T = T0 + (P/k) * (1 - exp(-t/tau))
 	// For simulation, use simpler linear ramp with thermal lag
-	targetTemp := m.cfg.Bias + (heaterPower+laserPower)*0.001 // 0.001 V per mW
-	thermalTimeConstant := 2.0                                // seconds
+	totalPower := heaterPower + laserPower
+	targetTemp := m.cfg.Bias + totalPower*0.001 // 0.001 V per mW
+	thermalTimeConstant := 2.0                  // seconds
 
 	// Update temperature with thermal lag
 	dt := m.cfg.SampleRate.Seconds()
@@ -204,28 +202,27 @@ func (m *Mock) generateSample() RawSample {
 		m.cfg.NoiseLevel * 0.5
 	m.temperature += noise
 
-	// Simulate voltage (for heater power measurement)
-	// Voltage increases when heaters are on
-	if heater1 || heater2 || heater3 {
-		m.voltage = math.Min(m.voltage+0.01, 2.5) // Ramp up to ~2.5V
-	} else {
-		m.voltage = math.Max(m.voltage-0.01, 0.0) // Ramp down
-	}
+	// Simulate voltage (constant reference voltage with noise)
+	// Voltage is not affected by heater state
+	voltageNoise := (math.Sin(float64(elapsed.Nanoseconds())*0.0007) +
+		math.Cos(float64(elapsed.Nanoseconds())*0.0009)) *
+		m.cfg.NoiseLevel * 0.1
+	m.voltage = 2.5 + voltageNoise // Constant ~2.5V with small noise
 
-	// Convert to ADC values (12-bit, 0-4095, 3.3V reference)
-	readingVal := (m.temperature / 3.3) * 4095
+	// Convert to ADC values (16-bit, 0-65535, 3.3V reference)
+	readingVal := (m.temperature / 3.3) * 65535
 	if readingVal < 0 {
 		readingVal = 0
-	} else if readingVal > 4095 {
-		readingVal = 4095
+	} else if readingVal > 65535 {
+		readingVal = 65535
 	}
 	readingADC := uint16(readingVal)
 
-	voltageVal := (m.voltage / 3.3) * 4095
+	voltageVal := (m.voltage / 3.3) * 65535
 	if voltageVal < 0 {
 		voltageVal = 0
-	} else if voltageVal > 4095 {
-		voltageVal = 4095
+	} else if voltageVal > 65535 {
+		voltageVal = 65535
 	}
 	voltageADC := uint16(voltageVal)
 

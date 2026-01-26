@@ -19,7 +19,7 @@ func TestDefault(t *testing.T) {
 	assert.Equal(t, float64(3.3), cfg.VoltageDivider.VRef)
 	assert.Len(t, cfg.Heaters, 3)
 	assert.Equal(t, float64(10), cfg.Measurement.WindowSeconds)
-	assert.Equal(t, float64(0.001), cfg.Measurement.PulseThreshold)
+	assert.Equal(t, float64(0.5), cfg.Measurement.PulseThresholdMVS)
 	assert.Equal(t, 10*time.Second, cfg.Calibration.BaselineDuration)
 	assert.Equal(t, 2*time.Second, cfg.Calibration.HeaterDuration)
 	assert.Equal(t, 20*time.Second, cfg.Calibration.CooloffDuration)
@@ -55,7 +55,7 @@ heaters:
 
 measurement:
   window_seconds: 5
-  pulse_threshold: 0.002
+  pulse_threshold_mvs: 2.0
 
 calibration:
   baseline_duration: 5s
@@ -81,7 +81,7 @@ calibration:
 	assert.Equal(t, float64(10000), cfg.VoltageDivider.R1)
 	assert.Equal(t, float64(10000), cfg.VoltageDivider.R2)
 	assert.Equal(t, float64(5), cfg.Measurement.WindowSeconds)
-	assert.Equal(t, float64(0.002), cfg.Measurement.PulseThreshold)
+	assert.Equal(t, float64(2.0), cfg.Measurement.PulseThresholdMVS)
 	assert.Equal(t, 5*time.Second, cfg.Calibration.BaselineDuration)
 	assert.Equal(t, 1*time.Second, cfg.Calibration.HeaterDuration)
 	assert.Equal(t, 15*time.Second, cfg.Calibration.CooloffDuration)
@@ -151,7 +151,7 @@ func TestConfig_FieldAccess(t *testing.T) {
 
 	// Test field access
 	assert.Equal(t, "COM3", cfg.Serial.Port)
-	assert.Equal(t, float64(2300), cfg.Heaters[0].Resistance)
-	assert.Equal(t, float64(500), cfg.Heaters[1].Resistance)
-	assert.Equal(t, float64(200), cfg.Heaters[2].Resistance)
+	assert.Equal(t, float64(2694), cfg.Heaters[0].Resistance)
+	assert.Equal(t, float64(511), cfg.Heaters[1].Resistance)
+	assert.Equal(t, float64(240.8), cfg.Heaters[2].Resistance)
 }

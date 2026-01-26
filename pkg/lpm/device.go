@@ -24,8 +24,8 @@ const (
 // RawSample represents a raw measurement sample from the MCU.
 type RawSample struct {
 	Timestamp time.Time
-	Reading   uint16 // 12-bit ADC reading (0-4095)
-	Voltage   uint16 // 12-bit ADC reading for voltage (0-4095)
+	Reading   uint16 // 16-bit ADC reading (0-65535) - TinyGo scales to 16-bit
+	Voltage   uint16 // 16-bit ADC reading for voltage (0-65535) - TinyGo scales to 16-bit
 	Heater1   bool   // Heater 1 state
 	Heater2   bool   // Heater 2 state
 	Heater3   bool   // Heater 3 state
@@ -218,6 +218,9 @@ func (d *Serial) readSamples() {
 	}()
 
 	scanner := bufio.NewScanner(d.conn)
+	samplesSkipped := 0
+	skipCount := 100
+
 	for {
 		select {
 		case <-d.ctx.Done():
@@ -241,6 +244,12 @@ func (d *Serial) readSamples() {
 			sample, err := parseLine(line)
 			if err != nil {
 				log.Printf("Failed to parse line '%s': %v", line, err)
+				continue
+			}
+
+			// Skip first 100 samples
+			if samplesSkipped < skipCount {
+				samplesSkipped++
 				continue
 			}
 
@@ -273,22 +282,22 @@ func parseLine(line string) (RawSample, error) {
 	}
 	timestamp := time.Unix(0, timestampMicros*1000) // Convert microseconds to nanoseconds
 
-	// Parse reading (12-bit ADC)
+	// Parse reading (16-bit ADC - TinyGo scales to 16-bit regardless of hardware resolution)
 	reading, err := strconv.ParseUint(parts[1], 10, 16)
 	if err != nil {
 		return RawSample{}, fmt.Errorf("invalid reading: %w", err)
 	}
-	if reading > 4095 {
-		return RawSample{}, fmt.Errorf("reading out of range: %d (max 4095)", reading)
+	if reading > 65535 {
+		return RawSample{}, fmt.Errorf("reading out of range: %d (max 65535)", reading)
 	}
 
-	// Parse voltage (12-bit ADC)
+	// Parse voltage (16-bit ADC - TinyGo scales to 16-bit regardless of hardware resolution)
 	voltage, err := strconv.ParseUint(parts[2], 10, 16)
 	if err != nil {
 		return RawSample{}, fmt.Errorf("invalid voltage: %w", err)
 	}
-	if voltage > 4095 {
-		return RawSample{}, fmt.Errorf("voltage out of range: %d (max 4095)", voltage)
+	if voltage > 65535 {
+		return RawSample{}, fmt.Errorf("voltage out of range: %d (max 65535)", voltage)
 	}
 
 	// Parse heater states (3 digits: heater1, heater2, heater3)

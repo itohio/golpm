@@ -1,4 +1,4 @@
-//go:generate tinygo flash -target=xiao
+//go:generate tinygo flash -target=pico
 
 package main
 
@@ -10,7 +10,6 @@ import (
 var (
 	adcAbsorber machine.ADC
 	adcVoltage  machine.ADC
-	uart        = machine.UART0
 
 	// Heater states
 	heaterStates    [3]bool
@@ -18,10 +17,9 @@ var (
 	ignoreCountdown int
 
 	// ADC averaging - running sums and counts
-	absorberSum   uint32
-	voltageSum    uint32
-	absorberCount int // Current count of samples (resets after N samples)
-	voltageCount  int // Current count of samples (resets after N samples)
+	absorberSum uint32
+	voltageSum  uint32
+	adcCount    int // Current count of samples (resets after N samples)
 
 	// Timing
 	lastADCRead time.Time
@@ -32,6 +30,8 @@ var (
 )
 
 func main() {
+	machine.InitADC()
+
 	// Configure heater pins as outputs
 	PIN_HEATER1.Configure(machine.PinConfig{Mode: machine.PinOutput})
 	PIN_HEATER2.Configure(machine.PinConfig{Mode: machine.PinOutput})
@@ -45,17 +45,20 @@ func main() {
 	adcVoltage = machine.ADC{Pin: PIN_VOLTAGE_ADC}
 
 	adcConfig := machine.ADCConfig{
-		Reference:  ADC_REFERENCE_MV,
+		// Reference:  ADC_REFERENCE_MV,
 		Resolution: ADC_RESOLUTION,
+		Samples:    32,
 	}
 
 	adcAbsorber.Configure(adcConfig)
 	adcVoltage.Configure(adcConfig)
 
 	// Configure UART for heater control
-	uart.Configure(machine.UARTConfig{
-		BaudRate: UART_BAUD_RATE,
-	})
+	// uart.Configure(machine.UARTConfig{
+	// 	BaudRate: UART_BAUD_RATE,
+	// 	TX:       machine.UART_TX_PIN,
+	// 	RX:       machine.UART_RX_PIN,
+	// })
 
 	// Initialize timing
 	lastADCRead = time.Now()
@@ -72,16 +75,16 @@ func main() {
 			readAbsorberADC()
 			readVoltageADC()
 			lastADCRead = now
+			adcCount++
 		}
 
 		// Check if we've collected N samples for either ADC and output
-		if absorberCount >= NUM_SAMPLES || voltageCount >= NUM_SAMPLES {
+		if adcCount >= NUM_SAMPLES {
 			outputAveragedValues()
 			// Reset and start accumulating again
 			absorberSum = 0
-			absorberCount = 0
 			voltageSum = 0
-			voltageCount = 0
+			adcCount = 0
 		}
 
 		// Small delay to prevent tight loop (but still allow precise timing)
@@ -98,7 +101,6 @@ func readAbsorberADC() {
 
 	value := adcAbsorber.Get()
 	absorberSum += uint32(value)
-	absorberCount++
 }
 
 func readVoltageADC() {
@@ -110,29 +112,16 @@ func readVoltageADC() {
 
 	value := adcVoltage.Get()
 	voltageSum += uint32(value)
-	voltageCount++
 }
 
 func outputAveragedValues() {
-	// Calculate average for absorber (use actual count, up to NUM_SAMPLES)
-	absorberN := absorberCount
-	if absorberN > NUM_SAMPLES {
-		absorberN = NUM_SAMPLES
+	if adcCount <= 0 {
+		return
 	}
-	if absorberN == 0 {
-		absorberN = 1 // Avoid division by zero
-	}
-	absorberAvg := uint16(absorberSum / uint32(absorberN))
+	absorberAvg := uint16(absorberSum / uint32(adcCount))
 
 	// Calculate average for voltage (use actual count, up to NUM_SAMPLES)
-	voltageN := voltageCount
-	if voltageN > NUM_SAMPLES {
-		voltageN = NUM_SAMPLES
-	}
-	if voltageN == 0 {
-		voltageN = 1 // Avoid division by zero
-	}
-	voltageAvg := uint16(voltageSum / uint32(voltageN))
+	voltageAvg := uint16(voltageSum / uint32(adcCount))
 
 	// Get timestamp in unix microseconds
 	now := time.Now()
@@ -167,12 +156,15 @@ func outputAveragedValues() {
 
 func processSerial() {
 	// Read available bytes from serial
-	for uart.Buffered() > 0 {
-		data, err := uart.ReadByte()
+	var (
+		data byte
+		err  error
+	)
+	for err == nil {
+		data, err = uart.ReadByte()
 		if err != nil {
 			break
 		}
-
 		// Check for newline (end of line)
 		if data == '\n' || data == '\r' {
 			if serialPos == 3 {
@@ -240,7 +232,6 @@ func updateHeaterStates() {
 		ignoreCountdown = IGNORE_SAMPLES_AFTER_CHANGE
 		absorberSum = 0
 		voltageSum = 0
-		absorberCount = 0
-		voltageCount = 0
+		adcCount = 0
 	}
 }

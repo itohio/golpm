@@ -15,9 +15,10 @@ import (
 func TestMeter_GracefulShutdown_NoCallbacksAfterClose(t *testing.T) {
 	cfg := &config.Config{
 		Measurement: config.MeasurementConfig{
-			WindowSeconds:    10.0,
-			PulseThreshold:   0.001,
-			MinPulseDuration: 1.0,
+			WindowSeconds:        10.0,
+			PulseThresholdMVS:    1.0, // 1 mV/s
+			MinPulseDuration:     1.0,
+			PulseLineFitRangeMVS: 1.0, // 1 mV/s acceptable range
 		},
 	}
 
@@ -76,9 +77,10 @@ func TestMeter_GracefulShutdown_NoCallbacksAfterClose(t *testing.T) {
 func TestMeter_ResetShutdown(t *testing.T) {
 	cfg := &config.Config{
 		Measurement: config.MeasurementConfig{
-			WindowSeconds:    10.0,
-			PulseThreshold:   0.001,
-			MinPulseDuration: 1.0,
+			WindowSeconds:        10.0,
+			PulseThresholdMVS:    1.0, // 1 mV/s
+			MinPulseDuration:     1.0,
+			PulseLineFitRangeMVS: 1.0, // 1 mV/s acceptable range
 		},
 	}
 

@@ -1,6 +1,7 @@
 package meter
 
 import (
+	"log"
 	"sync"
 	"time"
 
@@ -9,17 +10,6 @@ import (
 )
 
 var _ PowerMeter = (*Meter)(nil)
-
-// Pulse represents a detected heating pulse (Phase 1).
-type Pulse struct {
-	StartIndex int       // Start sample index in buffer
-	EndIndex   int       // End sample index in buffer (updated as pulse continues)
-	StartTime  time.Time // Start timestamp
-	EndTime    time.Time // End timestamp (updated as pulse continues)
-	RawValue   float64   // Raw derivative value (for debugging/display)
-	Power      float64   // Calculated power in mW (0 in Phase 1, calculated in Phase 2)
-	// Slope field added in Phase 2
-}
 
 // PowerMeter processes samples, maintains buffers, and detects pulses.
 type PowerMeter interface {
@@ -44,15 +34,20 @@ type Meter struct {
 	// appear as ordered slices for oscillogram drawing (first to last).
 	// Removal is based on timestamp (time window), not number of samples.
 	//
-	// Derivatives correspond exactly to sample pairs:
-	// - derivative[i] = (sample[i+1] - sample[i]) / dt
+	// Derivatives come directly from the Change field of samples (already filtered by the sample processing chain):
+	// - derivative[i] = sample[i+1].Change
 	// - If we have n samples, we have n-1 derivatives
-	// - derivative[0] corresponds to the change from sample[0] to sample[1]
-	// - derivative[1] corresponds to the change from sample[1] to sample[2]
+	// - derivative[0] corresponds to the change from sample[0] to sample[1] (stored in sample[1].Change)
+	// - derivative[1] corresponds to the change from sample[1] to sample[2] (stored in sample[2].Change)
 	// - etc.
-	samples     []sample.Sample // FIFO buffer of raw samples (ordered first to last, removed by timestamp)
-	derivatives []float64       // FIFO buffer of differentiated samples (n-1 derivatives for n samples, exactly corresponds to sample pairs)
-	pulses      []Pulse         // Detected pulses
+	samples     []sample.Sample // FIFO buffer of processed samples (ordered first to last, removed by timestamp)
+	derivatives []float64       // FIFO buffer of derivatives from Change field (n-1 derivatives for n samples)
+	pulses      []Pulse         // Detected and finalized pulses
+	activePulse *Pulse          // Currently active pulse being built (nil if no active pulse)
+
+	// Pulse detection state
+	nextPulseID      int       // Auto-incrementing ID for next pulse
+	lastPulseEndTime time.Time // Time when last pulse ended (for cooling phase tracking)
 
 	// Thread safety
 	mu sync.RWMutex
@@ -63,9 +58,13 @@ type Meter struct {
 	cbMu      sync.RWMutex
 
 	// Configuration
-	windowDuration   time.Duration
-	threshold        float64
-	minPulseDuration time.Duration
+	windowDuration        time.Duration
+	threshold             float64 // in V/s (converted from mV/s)
+	minPulseDuration      time.Duration
+	lineFitMinDuration    time.Duration
+	lineFitRangeMVS       float64 // acceptable range in mV/s
+	absorbanceCoefficient float64
+	powerPolynomial       []float64
 
 	// Shutdown control
 	shutdown bool // Set to true when input channel closes, prevents further callbacks
@@ -74,16 +73,28 @@ type Meter struct {
 // New creates a new PowerMeter instance.
 // Returns concrete type (*Meter) following Go best practices.
 func New(cfg *config.Config) *Meter {
+	minPulseDuration := time.Duration(cfg.Measurement.MinPulseDuration * float64(time.Second))
+	lineFitMinDuration := time.Duration(cfg.Measurement.PulseLineFitMinDuration * float64(time.Second))
+
+	// Use MinPulseDuration for line fitting if PulseLineFitMinDuration is not set or is larger
+	if lineFitMinDuration == 0 || lineFitMinDuration > minPulseDuration {
+		lineFitMinDuration = minPulseDuration
+	}
+
 	m := &Meter{
-		cfg:              cfg,
-		samples:          make([]sample.Sample, 0),
-		derivatives:      make([]float64, 0),
-		pulses:           make([]Pulse, 0),
-		callbacks:        make([]func(samples []sample.Sample, derivatives []float64, pulses []Pulse), 0),
-		windowDuration:   time.Duration(cfg.Measurement.WindowSeconds * float64(time.Second)),
-		threshold:        cfg.Measurement.PulseThreshold,
-		minPulseDuration: time.Duration(cfg.Measurement.MinPulseDuration * float64(time.Second)),
-		shutdown:         false,
+		cfg:                   cfg,
+		samples:               make([]sample.Sample, 0),
+		derivatives:           make([]float64, 0),
+		pulses:                make([]Pulse, 0),
+		callbacks:             make([]func(samples []sample.Sample, derivatives []float64, pulses []Pulse), 0),
+		windowDuration:        time.Duration(cfg.Measurement.WindowSeconds * float64(time.Second)),
+		threshold:             cfg.Measurement.PulseThresholdMVS / 1000.0, // Convert mV/s to V/s
+		minPulseDuration:      minPulseDuration,
+		lineFitMinDuration:    lineFitMinDuration,
+		lineFitRangeMVS:       cfg.Measurement.PulseLineFitRangeMVS,
+		absorbanceCoefficient: cfg.Measurement.AbsorbanceCoefficient,
+		powerPolynomial:       cfg.Measurement.PowerPolynomial,
+		shutdown:              false,
 	}
 
 	return m
@@ -124,7 +135,7 @@ func (m *Meter) processSample(s sample.Sample) {
 		m.samples = m.samples[cutoffIndex:]
 
 		// Remove corresponding derivatives to keep exact correspondence
-		// derivative[i] = (sample[i+1] - sample[i]) / dt
+		// derivative[i] = sample[i+1].Change
 		// If we remove samples[0..cutoffIndex-1], we need to remove derivatives[0..cutoffIndex-1]
 		// because those derivatives correspond to pairs involving removed samples
 		if cutoffIndex <= len(m.derivatives) {
@@ -147,27 +158,35 @@ func (m *Meter) processSample(s sample.Sample) {
 			}
 		}
 		m.pulses = validPulses
+
+		// Adjust active pulse indices
+		if m.activePulse != nil {
+			m.activePulse.StartIndex -= cutoffIndex
+			m.activePulse.EndIndex -= cutoffIndex
+
+			// If active pulse is now invalid, clear it
+			if m.activePulse.StartIndex < 0 {
+				m.activePulse = nil
+			}
+		}
 	}
 
-	// Update derivatives (need at least 2 samples)
-	// Calculate derivative for the new sample pair: (sample[n-1], sample[n])
+	// Update derivatives using Change field from samples
 	// derivative[i] corresponds exactly to the change from sample[i] to sample[i+1]
+	// This is stored in sample[i+1].Change (already filtered by the sample processing chain)
 	if len(m.samples) >= 2 {
 		lastIdx := len(m.samples) - 1
-		prev := m.samples[lastIdx-1] // sample[i]
-		curr := m.samples[lastIdx]   // sample[i+1]
+		curr := m.samples[lastIdx] // sample[i+1]
 
-		dt := curr.Timestamp.Sub(prev.Timestamp).Seconds()
-		if dt > 0 {
-			// Calculate derivative: (sample[i+1] - sample[i]) / dt
-			derivative := (curr.Reading - prev.Reading) / dt
-			m.derivatives = append(m.derivatives, derivative)
+		// Use Change field from current sample (already filtered by the sample processing chain)
+		derivative := curr.Change
 
-			// Ensure exact correspondence: n samples = n-1 derivatives
-			// If somehow we have more derivatives than expected, remove oldest
-			if len(m.derivatives) > len(m.samples)-1 {
-				m.derivatives = m.derivatives[1:]
-			}
+		// Store derivative
+		m.derivatives = append(m.derivatives, derivative)
+
+		// Ensure exact correspondence: n samples = n-1 derivatives
+		if len(m.derivatives) > len(m.samples)-1 {
+			m.derivatives = m.derivatives[1:]
 		}
 	}
 
@@ -189,94 +208,121 @@ func (m *Meter) processSample(s sample.Sample) {
 	m.mu.Lock()
 }
 
-// updatePulses detects and updates pulses based on derivatives.
+// updatePulses detects and updates pulses using modular Pulse struct.
+// Simplified logic:
+// 1. If no active pulse and derivative > threshold → start new pulse
+// 2. If active pulse → let it update itself with new data
+// 3. If pulse finalizes → add to pulses array and clear activePulse
+// 4. Remove pulses outside time window (FIFO)
 func (m *Meter) updatePulses() {
-	if len(m.derivatives) == 0 {
+	if len(m.derivatives) == 0 || len(m.samples) < 2 {
 		return
 	}
 
 	lastDerivIdx := len(m.derivatives) - 1
-	lastDeriv := m.derivatives[lastDerivIdx]
-	lastSampleIdx := len(m.samples) - 1
+	currentTime := m.samples[lastDerivIdx+1].Timestamp
 
-	// Check if we're in a heating phase (derivative above threshold)
-	isHeating := lastDeriv > m.threshold
+	// Decision point 1: Should we start a new pulse?
+	if m.activePulse == nil {
+		if ShouldStartNewPulse(m.derivatives, lastDerivIdx, m.threshold, m.lastPulseEndTime, currentTime) {
+			// Start new pulse
+			m.nextPulseID++
+			config := PulseConfig{
+				ID:                  m.nextPulseID,
+				MinDuration:         m.minPulseDuration,
+				StdDevThresholdMVS:  m.lineFitRangeMVS,
+				SlopeThreshold:      m.threshold,
+				AbsorbanceCoeff:     m.absorbanceCoefficient,
+				PowerPolynomial:     m.powerPolynomial,
+				HeaterPowerProvider: m.calculateAvgHeaterPower,
+			}
+			m.activePulse = NewPulse(config, m.samples, m.derivatives, lastDerivIdx)
 
-	// Update existing active pulses or create new ones
-	if isHeating {
-		// Find active pulse (last pulse that might still be active)
-		activePulseIdx := -1
-		for i := len(m.pulses) - 1; i >= 0; i-- {
-			if m.pulses[i].EndIndex == lastSampleIdx-1 {
-				// This pulse was just extended, check if it's still active
-				activePulseIdx = i
-				break
+			if m.activePulse != nil {
+				log.Printf("[PULSE #%d] Started pulse detection at index %d (deriv=%.3f mV/s, threshold=%.3f mV/s)",
+					m.activePulse.ID, lastDerivIdx, m.derivatives[lastDerivIdx]*1000.0, m.threshold*1000.0)
+			}
+		}
+		return
+	}
+
+	// Decision point 2: Update active pulse with new data
+	if m.activePulse.IsActive() {
+		shouldContinue := m.activePulse.Update(m.samples, m.derivatives, lastDerivIdx)
+
+		// Check if pulse became official (met minimum duration)
+		if m.activePulse.IsOfficial() && !m.pulseInArray(m.activePulse.ID) {
+			// Add to pulses array
+			m.pulses = append(m.pulses, *m.activePulse)
+			log.Printf("[PULSE #%d] Pulse became OFFICIAL: duration=%.3fs >= min=%.3fs, slope=%.3f mV/s, stdDev=%.3f mV/s, power=%.6f W, heater=%.6f W",
+				m.activePulse.ID, m.activePulse.Duration().Seconds(), m.minPulseDuration.Seconds(),
+				m.activePulse.AvgSlope*1000.0, m.activePulse.StdDev*1000.0,
+				m.activePulse.AvgPower, m.activePulse.AvgHeaterPower)
+		} else if m.pulseInArray(m.activePulse.ID) {
+			// Update existing pulse in array
+			for i := range m.pulses {
+				if m.pulses[i].ID == m.activePulse.ID {
+					m.pulses[i] = *m.activePulse
+					break
+				}
 			}
 		}
 
-		if activePulseIdx >= 0 {
-			// Extend existing pulse
-			m.pulses[activePulseIdx].EndIndex = lastSampleIdx
-			m.pulses[activePulseIdx].EndTime = m.samples[lastSampleIdx].Timestamp
-			m.pulses[activePulseIdx].RawValue = lastDeriv
-		} else {
-			// Check if we should start a new pulse
-			// Only start if previous derivative was below threshold (or this is first)
-			shouldStart := true
-			if lastDerivIdx > 0 {
-				prevDeriv := m.derivatives[lastDerivIdx-1]
-				if prevDeriv > m.threshold {
-					// Previous was also above threshold, might be continuation
-					// Check if there's a gap (cooling phase) between last pulse and now
-					shouldStart = false
-					if len(m.pulses) > 0 {
-						lastPulse := m.pulses[len(m.pulses)-1]
-						// If there's a gap, start new pulse
-						if lastSampleIdx-1 > lastPulse.EndIndex+1 {
-							shouldStart = true
-						}
-					}
-				}
+		// If pulse should not continue, finalize it
+		if !shouldContinue {
+			if m.activePulse.IsOfficial() {
+				m.lastPulseEndTime = currentTime
+			} else {
+				// Pulse was rejected (too short)
+				log.Printf("[PULSE #%d] Pulse REJECTED: duration %.3fs < min %.3fs",
+					m.activePulse.ID, m.activePulse.Duration().Seconds(), m.minPulseDuration.Seconds())
+				// Remove from array if it was added
+				m.removePulseFromArray(m.activePulse.ID)
 			}
-
-			if shouldStart {
-				// Start new pulse
-				startIdx := lastSampleIdx - 1
-				if startIdx < 0 {
-					startIdx = 0
-				}
-				newPulse := Pulse{
-					StartIndex: startIdx,
-					EndIndex:   lastSampleIdx,
-					StartTime:  m.samples[startIdx].Timestamp,
-					EndTime:    m.samples[lastSampleIdx].Timestamp,
-					RawValue:   lastDeriv,
-					Power:      0.0, // Will be calculated in Phase 2
-				}
-				m.pulses = append(m.pulses, newPulse)
-			} else if len(m.pulses) > 0 {
-				// Extend the last pulse if it was close
-				lastPulseIdx := len(m.pulses) - 1
-				lastPulse := &m.pulses[lastPulseIdx]
-				if lastSampleIdx <= lastPulse.EndIndex+2 {
-					// Close enough, extend it
-					lastPulse.EndIndex = lastSampleIdx
-					lastPulse.EndTime = m.samples[lastSampleIdx].Timestamp
-					lastPulse.RawValue = lastDeriv
-				}
-			}
+			m.activePulse = nil
 		}
 	}
 
-	// Remove pulses that are completely outside the window or too short (noise filtering)
+	// Remove pulses outside the time window (FIFO)
+	m.removeOldPulses()
+}
+
+// pulseInArray checks if a pulse with the given ID is in the pulses array.
+func (m *Meter) pulseInArray(id int) bool {
+	for _, p := range m.pulses {
+		if p.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// removePulseFromArray removes a pulse with the given ID from the pulses array.
+func (m *Meter) removePulseFromArray(id int) {
+	validPulses := make([]Pulse, 0, len(m.pulses))
+	for _, p := range m.pulses {
+		if p.ID != id {
+			validPulses = append(validPulses, p)
+		}
+	}
+	m.pulses = validPulses
+}
+
+// removeOldPulses removes pulses that are completely outside the time window.
+func (m *Meter) removeOldPulses() {
+	if len(m.samples) == 0 {
+		return
+	}
+
+	oldestSampleTime := m.samples[0].Timestamp
 	validPulses := make([]Pulse, 0, len(m.pulses))
 	for _, pulse := range m.pulses {
-		if pulse.StartIndex >= 0 && pulse.StartIndex < len(m.samples) {
-			// Filter out pulses shorter than minimum duration
-			duration := pulse.EndTime.Sub(pulse.StartTime)
-			if duration >= m.minPulseDuration {
-				validPulses = append(validPulses, pulse)
-			}
+		// Keep pulse if its end time is after the oldest sample
+		if pulse.EndTime.After(oldestSampleTime) || pulse.EndTime.Equal(oldestSampleTime) {
+			validPulses = append(validPulses, pulse)
+		} else {
+			log.Printf("[PULSE #%d] Removed from buffer: ended at %v, oldest sample at %v",
+				pulse.ID, pulse.EndTime.Format("15:04:05.000"), oldestSampleTime.Format("15:04:05.000"))
 		}
 	}
 	m.pulses = validPulses
@@ -352,6 +398,91 @@ func (m *Meter) notifyCallbacks() {
 	for _, cb := range callbacks {
 		if cb != nil {
 			cb(samplesCopy, derivativesCopy, pulsesCopy)
+		}
+	}
+}
+
+// lineFitResult contains the result of a horizontal line fit.
+// calculateAvgHeaterPower calculates the average heater power during a pulse segment.
+func (m *Meter) calculateAvgHeaterPower(startIdx, endIdx int) float64 {
+	if startIdx < 0 || endIdx >= len(m.samples) || startIdx > endIdx {
+		return 0.0
+	}
+
+	sum := 0.0
+	count := 0
+	for i := startIdx; i <= endIdx && i < len(m.samples); i++ {
+		sum += m.samples[i].HeaterPower
+		count++
+	}
+
+	if count == 0 {
+		return 0.0
+	}
+	return sum / float64(count)
+}
+
+// calculatePower calculates power from slope using polynomial and absorbance coefficient.
+// Power = (c0 + c1*slope + c2*slope² + c3*slope³) / absorbanceCoefficient
+// The absorbance coefficient corrects for reflection losses (<1 means some light is reflected).
+func (m *Meter) calculatePower(slope float64) float64 {
+	if len(m.powerPolynomial) < 4 {
+		// Fallback: linear relationship if polynomial not configured
+		return slope / m.absorbanceCoefficient
+	}
+
+	// Calculate polynomial: c0 + c1*x + c2*x² + c3*x³
+	c0 := m.powerPolynomial[0]
+	c1 := m.powerPolynomial[1]
+	c2 := m.powerPolynomial[2]
+	c3 := m.powerPolynomial[3]
+
+	power := c0 + c1*slope + c2*slope*slope + c3*slope*slope*slope
+
+	// Apply absorbance correction
+	if m.absorbanceCoefficient > 0 {
+		power /= m.absorbanceCoefficient
+	}
+
+	return power
+}
+
+// UpdateCalibration updates the power calculation polynomial and absorbance coefficient.
+// This allows runtime calibration updates without restarting the meter.
+func (m *Meter) UpdateCalibration(polynomial []float64, absorbanceCoefficient float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if len(polynomial) >= 4 {
+		m.powerPolynomial = polynomial[:4]
+	}
+	m.absorbanceCoefficient = absorbanceCoefficient
+
+	// Update power configuration for all existing pulses and recalculate
+	for i := range m.pulses {
+		m.pulses[i].absorbanceCoeff = absorbanceCoefficient
+		if len(polynomial) >= 4 {
+			m.pulses[i].powerPolynomial = polynomial[:4]
+		}
+		m.pulses[i].AvgPower = m.pulses[i].Power()
+	}
+
+	// Update power configuration for active pulse if it exists
+	if m.activePulse != nil {
+		m.activePulse.absorbanceCoeff = absorbanceCoefficient
+		if len(polynomial) >= 4 {
+			m.activePulse.powerPolynomial = polynomial[:4]
+		}
+		m.activePulse.AvgPower = m.activePulse.Power()
+
+		// Update in pulses array if it's already official
+		if m.activePulse.IsOfficial() {
+			for i := range m.pulses {
+				if m.pulses[i].ID == m.activePulse.ID {
+					m.pulses[i] = *m.activePulse
+					break
+				}
+			}
 		}
 	}
 }
