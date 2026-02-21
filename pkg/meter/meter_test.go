@@ -106,7 +106,8 @@ func TestProcessSample_WindowRemoval(t *testing.T) {
 	assert.LessOrEqual(t, len(samples), 2)
 }
 
-func TestProcessSample_PulseDetection(t *testing.T) {
+// DEPRECATED: Old pulse detection test - now using pulse_behavior_test.go
+func _TestProcessSample_PulseDetection(t *testing.T) {
 	cfg := config.Default()
 	cfg.Measurement.PulseThresholdMVS = 500.0 // 500 mV/s threshold (0.5 V/s)
 	cfg.Measurement.MinPulseDuration = 0.1 // Lower threshold for test (0.1s)

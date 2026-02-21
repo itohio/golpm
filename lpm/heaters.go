@@ -58,19 +58,25 @@ func updateHeaterStatesFromSample(state *appState, sample lpm.RawSample) {
 }
 
 // updateHeaterButtonStates updates the visual state of heater buttons.
-// Also controls visibility of "Add Cal Point" button - only visible when at least one heater is on.
+// Also controls visibility of "Add Cal Point" button and "Heater Off" button - only enabled when at least one heater is on.
 func updateHeaterButtonStates(state *appState) {
 	updateHeaterButton(state.heater1Btn, state.heaterState[0])
 	updateHeaterButton(state.heater2Btn, state.heaterState[1])
 	updateHeaterButton(state.heater3Btn, state.heaterState[2])
 
-	// Show "Add Cal Point" button only when at least one heater is on
+	// Show/enable buttons only when at least one heater is on
 	anyHeaterOn := state.heaterState[0] || state.heaterState[1] || state.heaterState[2]
 	if anyHeaterOn {
 		state.addCalPointBtn.Show()
+		state.heaterOffBtn.Enable()
 	} else {
 		state.addCalPointBtn.Hide()
+		state.heaterOffBtn.Disable()
 	}
+
+	// Refresh buttons to update visual state
+	state.addCalPointBtn.Refresh()
+	state.heaterOffBtn.Refresh()
 }
 
 // updateHeaterButton updates a single heater button's visual state.

@@ -1,0 +1,60 @@
+serial:
+    port: COM7
+voltage_divider:
+    r1: 20000
+    r2: 20000
+    vref: 3.3
+heaters:
+    - resistance: 2694
+    - resistance: 511
+    - resistance: 240.8
+measurement:
+    window_seconds: 60
+    pulse_threshold_mvs: 0.5
+    min_pulse_duration: 10
+    smoothing_alpha: 0.045
+    spike_filter_window_size: 700ms
+    downsample_rate: 0s
+    change_filter_type: ema
+    change_filter_alpha: 0.072
+    change_filter_window_size: 2s
+    pulse_line_fit_min_duration: 1
+    pulse_line_fit_range_mvs: 0.45
+    absorbance_coefficient: 0.9
+    power_polynomial:
+        - 0.00014599138770808132
+        - 6.805934158689438
+        - -245.61020225197328
+        - 6809.366817192355
+calibration:
+    baseline_duration: 10s
+    heater_duration: 2s
+    cooloff_duration: 20s
+    heater_sequence:
+        - 1
+        - 2
+        - 3
+    points:
+        - slope: 0
+          power: 0
+        - slope: 0.010815559857252452
+          power: 0.04997982449758373
+        - slope: 0.01111551509310578
+          power: 0.059422658363314645
+        - slope: 0.023041450641519322
+          power: 0.10575705319696929
+        - slope: 0.028006331453863335
+          power: 0.15530334282580396
+        - slope: 0.030181149163516236
+          power: 0.1647168842648397
+        - slope: 0.024791545766008876
+          power: 0.10574166595270386
+        - slope: 0.008549989359320298
+          power: 0.04995999525882391
+mock:
+    bias: 0
+    noise_level: 0.001
+    laser_power: 40
+    laser_duration: 2s
+    laser_period: 20s
+    sample_rate: 20ms

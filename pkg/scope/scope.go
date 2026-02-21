@@ -24,6 +24,7 @@ type ScopeWidget struct {
 	samples     []sample.Sample
 	derivatives []float64
 	pulses      []meter.Pulse
+	activePulse *meter.Pulse // Currently tracked pulse (Fitting or Updating), drawn in gray
 	heaterPower float64
 
 	// Display buffers (reused for downsampling)
@@ -59,7 +60,7 @@ func New(cfg *config.Config) *ScopeWidget {
 
 // UpdateData updates the widget with new measurement data.
 // This should be called from the measurement callback using fyne.Do().
-func (s *ScopeWidget) UpdateData(samples []sample.Sample, derivatives []float64, pulses []meter.Pulse, heaterPower float64) {
+func (s *ScopeWidget) UpdateData(samples []sample.Sample, derivatives []float64, pulses []meter.Pulse, activePulse *meter.Pulse, heaterPower float64) {
 	s.mu.Lock()
 
 	// Downsample for display (reuse buffers)
@@ -70,6 +71,7 @@ func (s *ScopeWidget) UpdateData(samples []sample.Sample, derivatives []float64,
 	s.samples = samples
 	s.derivatives = derivatives
 	s.pulses = pulses
+	s.activePulse = activePulse // May be nil if no active tracking
 	s.heaterPower = heaterPower
 
 	// Calculate auto-scaling

@@ -16,7 +16,8 @@ type PowerMeter interface {
 	ProcessSamples(input <-chan sample.Sample)
 	Samples() []sample.Sample                                                      // Get current raw samples buffer (FIFO, ordered first to last)
 	Derivatives() []float64                                                        // Get differentiated samples (corresponds to Samples, n-1 derivatives for n samples)
-	Pulses() []Pulse                                                               // Get detected pulses within window
+	Pulses() []Pulse                                                               // Get detected pulses within window (Updating + Finalized)
+	ActivePulse() *Pulse                                                           // Get currently tracked pulse (Fitting or Updating), nil if none
 	OnUpdate(func(samples []sample.Sample, derivatives []float64, pulses []Pulse)) // Register callback for updates
 }
 
@@ -247,19 +248,21 @@ func (m *Meter) updatePulses() {
 	}
 
 	// Decision point 2: Update active pulse with new data
-	if m.activePulse.IsActive() {
+	// CRITICAL: Only update if NOT already finalized (finalized = frozen, should not be modified)
+	if m.activePulse.IsActive() && !m.activePulse.IsFinalized() {
 		shouldContinue := m.activePulse.Update(m.samples, m.derivatives, lastDerivIdx)
 
-		// Check if pulse became official (met minimum duration)
-		if m.activePulse.IsOfficial() && !m.pulseInArray(m.activePulse.ID) {
-			// Add to pulses array
+		// State transition: Fitting → Updating (add to list when it becomes official)
+		if m.activePulse.IsUpdating() && !m.pulseInArray(m.activePulse.ID) {
+			// Pulse just transitioned from Fitting to Updating - add to list
 			m.pulses = append(m.pulses, *m.activePulse)
-			log.Printf("[PULSE #%d] Pulse became OFFICIAL: duration=%.3fs >= min=%.3fs, slope=%.3f mV/s, stdDev=%.3f mV/s, power=%.6f W, heater=%.6f W",
-				m.activePulse.ID, m.activePulse.Duration().Seconds(), m.minPulseDuration.Seconds(),
+			log.Printf("[PULSE #%d] Added to list: duration=%.3fs, slope=%.3f mV/s, stdDev=%.3f mV/s, power=%.6f W",
+				m.activePulse.ID, m.activePulse.Duration().Seconds(),
 				m.activePulse.AvgSlope*1000.0, m.activePulse.StdDev*1000.0,
-				m.activePulse.AvgPower, m.activePulse.AvgHeaterPower)
-		} else if m.pulseInArray(m.activePulse.ID) {
-			// Update existing pulse in array
+				m.activePulse.AvgPower)
+		} else if m.activePulse.IsUpdating() {
+			// Pulse is Updating - update in list
+			// NOTE: We do NOT update Finalized pulses (they are frozen)
 			for i := range m.pulses {
 				if m.pulses[i].ID == m.activePulse.ID {
 					m.pulses[i] = *m.activePulse
@@ -268,17 +271,24 @@ func (m *Meter) updatePulses() {
 			}
 		}
 
-		// If pulse should not continue, finalize it
+		// If pulse should not continue (discarded or finalized), clear active pulse
 		if !shouldContinue {
-			if m.activePulse.IsOfficial() {
+			if m.activePulse.IsFinalized() {
+				// Pulse was finalized - record end time and ensure it's in the list
 				m.lastPulseEndTime = currentTime
-			} else {
-				// Pulse was rejected (too short)
-				log.Printf("[PULSE #%d] Pulse REJECTED: duration %.3fs < min %.3fs",
-					m.activePulse.ID, m.activePulse.Duration().Seconds(), m.minPulseDuration.Seconds())
-				// Remove from array if it was added
-				m.removePulseFromArray(m.activePulse.ID)
+
+				// Final update to list with Finalized state
+				for i := range m.pulses {
+					if m.pulses[i].ID == m.activePulse.ID {
+						m.pulses[i] = *m.activePulse
+						break
+					}
+				}
+
+				log.Printf("[PULSE #%d] Pulse finalized and cleared from active tracking",
+					m.activePulse.ID)
 			}
+			// If Fitting pulse was discarded, it's already logged in Update()
 			m.activePulse = nil
 		}
 	}
@@ -309,6 +319,8 @@ func (m *Meter) removePulseFromArray(id int) {
 }
 
 // removeOldPulses removes pulses that are completely outside the time window.
+// Uses DetectEndTime (not EndTime) because the fitted window may be trimmed but
+// the pulse should remain visible as long as its detection window overlaps with samples.
 func (m *Meter) removeOldPulses() {
 	if len(m.samples) == 0 {
 		return
@@ -317,12 +329,14 @@ func (m *Meter) removeOldPulses() {
 	oldestSampleTime := m.samples[0].Timestamp
 	validPulses := make([]Pulse, 0, len(m.pulses))
 	for _, pulse := range m.pulses {
-		// Keep pulse if its end time is after the oldest sample
-		if pulse.EndTime.After(oldestSampleTime) || pulse.EndTime.Equal(oldestSampleTime) {
+		// Keep pulse if its DETECTION end time is after the oldest sample
+		// This ensures pulse stays visible even if fit was trimmed
+		if pulse.DetectEndTime.After(oldestSampleTime) || pulse.DetectEndTime.Equal(oldestSampleTime) {
 			validPulses = append(validPulses, pulse)
 		} else {
-			log.Printf("[PULSE #%d] Removed from buffer: ended at %v, oldest sample at %v",
-				pulse.ID, pulse.EndTime.Format("15:04:05.000"), oldestSampleTime.Format("15:04:05.000"))
+			log.Printf("[PULSE #%d] Removed from buffer: detect ended at %v (fit ended at %v), oldest sample at %v",
+				pulse.ID, pulse.DetectEndTime.Format("15:04:05.000"),
+				pulse.EndTime.Format("15:04:05.000"), oldestSampleTime.Format("15:04:05.000"))
 		}
 	}
 	m.pulses = validPulses
@@ -356,6 +370,22 @@ func (m *Meter) Pulses() []Pulse {
 	result := make([]Pulse, len(m.pulses))
 	copy(result, m.pulses)
 	return result
+}
+
+// ActivePulse returns the currently tracked pulse (Fitting or Updating state).
+// Returns nil if no pulse is currently being tracked.
+// This allows UI to show Fitting pulses before they become official.
+func (m *Meter) ActivePulse() *Pulse {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.activePulse == nil {
+		return nil
+	}
+
+	// Return a copy to avoid race conditions
+	pulseCopy := *m.activePulse
+	return &pulseCopy
 }
 
 // OnUpdate registers a callback function that will be called when samples are updated.
@@ -475,8 +505,8 @@ func (m *Meter) UpdateCalibration(polynomial []float64, absorbanceCoefficient fl
 		}
 		m.activePulse.AvgPower = m.activePulse.Power()
 
-		// Update in pulses array if it's already official
-		if m.activePulse.IsOfficial() {
+		// Update in pulses array if it's Updating or Finalized (in list)
+		if m.activePulse.IsUpdating() || m.activePulse.IsFinalized() {
 			for i := range m.pulses {
 				if m.pulses[i].ID == m.activePulse.ID {
 					m.pulses[i] = *m.activePulse

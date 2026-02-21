@@ -167,10 +167,11 @@ func createToolbar(state *appState) fyne.CanvasObject {
 	state.heaterIncrementBtn = heaterIncrementBtn
 
 	// Heater off button (turn off all heaters)
+	// Only enabled when at least one heater is on
 	heaterOffBtn := widget.NewButtonWithIcon("", theme.MediaStopIcon(), func() {
 		handleHeaterOff(state)
 	})
-	heaterOffBtn.Disable()
+	heaterOffBtn.Disable() // Start disabled - enabled by updateHeaterButtonStates when heaters turn on
 	heaterOffBtn.Importance = widget.DangerImportance
 	state.heaterOffBtn = heaterOffBtn
 
@@ -276,7 +277,7 @@ func handleConnect(state *appState) {
 		state.heater3Btn.Enable()
 		state.addCalPointBtn.Enable()
 		state.heaterIncrementBtn.Enable()
-		state.heaterOffBtn.Enable()
+		// heaterOffBtn is controlled by updateHeaterButtonStates - only enabled when heaters are on
 
 		// Reset meter shutdown flag for new chain
 		state.powerMeter.ResetShutdown()
@@ -303,6 +304,9 @@ func handleConnect(state *appState) {
 				heaterPower = samples[len(samples)-1].HeaterPower
 			}
 
+			// Get active pulse (Fitting or Updating state) for real-time display
+			activePulse := state.powerMeter.ActivePulse()
+
 			// Update timestamp
 			state.updateMu.Lock()
 			state.lastUpdateTime = now
@@ -311,7 +315,7 @@ func handleConnect(state *appState) {
 			// Update scope widget on main thread
 			// Scope widget handles downsampling internally, so pass full data
 			fyne.Do(func() {
-				state.scopeWidget.UpdateData(samples, derivatives, pulses, heaterPower)
+				state.scopeWidget.UpdateData(samples, derivatives, pulses, activePulse, heaterPower)
 			})
 		})
 

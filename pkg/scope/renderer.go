@@ -1,6 +1,7 @@
 package scope
 
 import (
+	"fmt"
 	"image/color"
 	"math"
 	"time"
@@ -69,6 +70,7 @@ func (r *scopeRenderer) Refresh() {
 	samples := r.scope.displaySamples
 	derivatives := r.scope.displayDerivatives
 	pulses := r.scope.pulses
+	activePulse := r.scope.activePulse // May be nil
 	heaterPower := r.scope.heaterPower
 	sampleYMin := r.scope.sampleYMin
 	sampleYMax := r.scope.sampleYMax
@@ -152,6 +154,11 @@ func (r *scopeRenderer) Refresh() {
 
 	// Draw power labels (use derivative Y-axis for positioning - labels go on fitted line)
 	r.drawPowerLabels(plotX, plotY, plotWidth, plotHeight, pulses, samples, derivativeYMin, derivativeYMax, xMin, xMax)
+
+	// Draw active pulse (Fitting or Updating) in gray/dashed to show what's being tracked
+	if activePulse != nil {
+		r.drawActivePulse(plotX, plotY, plotWidth, plotHeight, activePulse, samples, derivatives, derivativeYMin, derivativeYMax, xMin, xMax)
+	}
 
 	// Draw heater power and voltage indicator (use sample Y-axis)
 	if heaterPower > 0 {
@@ -475,22 +482,24 @@ func (r *scopeRenderer) drawPowerLabels(plotX, plotY, plotWidth, plotHeight floa
 
 		x := plotX + float32(centerTime.Sub(xMin).Seconds()/xMax.Sub(xMin).Seconds())*plotWidth
 
-		// Position labels on the fitted line (AvgSlope) using derivative Y-axis
-		// This places labels directly on the green fitted line
+		// Calculate Y position of fitted line
 		yRange := yMax - yMin
-		var y float32
+		var yLine float32
 		if yRange == 0 {
-			y = plotY + plotHeight/2
+			yLine = plotY + plotHeight/2
 		} else {
-			y = plotY + plotHeight - float32((pulse.AvgSlope-yMin)/yRange)*plotHeight
+			yLine = plotY + plotHeight - float32((pulse.AvgSlope-yMin)/yRange)*plotHeight
 		}
+
+		// Position main labels ABOVE the fitted line (60px up)
+		yLabel := yLine - 60
 
 		// Optical power label (large, orange, most prominent)
 		powerText := formatPower(pulse.AvgPower)
 		powerLabel := canvas.NewText(powerText, color.RGBA{R: 255, G: 165, B: 0, A: 255}) // Orange
 		powerLabel.TextSize = 16
 		powerLabel.Alignment = fyne.TextAlignCenter
-		powerLabel.Move(fyne.NewPos(x-40, y-30)) // Above fitted line
+		powerLabel.Move(fyne.NewPos(x-40, yLabel)) // 60px above line
 		r.powerLabels = append(r.powerLabels, powerLabel)
 		r.objects = append(r.objects, powerLabel)
 
@@ -499,7 +508,7 @@ func (r *scopeRenderer) drawPowerLabels(plotX, plotY, plotWidth, plotHeight floa
 		slopeLabel := canvas.NewText(slopeText, color.RGBA{R: 100, G: 200, B: 255, A: 255}) // Light blue (matches derivative color)
 		slopeLabel.TextSize = 12
 		slopeLabel.Alignment = fyne.TextAlignCenter
-		slopeLabel.Move(fyne.NewPos(x-40, y-12)) // Middle
+		slopeLabel.Move(fyne.NewPos(x-40, yLabel+20)) // Below power
 		r.powerLabels = append(r.powerLabels, slopeLabel)
 		r.objects = append(r.objects, slopeLabel)
 
@@ -508,9 +517,19 @@ func (r *scopeRenderer) drawPowerLabels(plotX, plotY, plotWidth, plotHeight floa
 		heaterLabel := canvas.NewText(heaterText, color.RGBA{R: 255, G: 165, B: 0, A: 255}) // Orange
 		heaterLabel.TextSize = 10
 		heaterLabel.Alignment = fyne.TextAlignCenter
-		heaterLabel.Move(fyne.NewPos(x-40, y+2)) // Below, slightly overlapping fitted line
+		heaterLabel.Move(fyne.NewPos(x-40, yLabel+35)) // Below slope
 		r.powerLabels = append(r.powerLabels, heaterLabel)
 		r.objects = append(r.objects, heaterLabel)
+
+		// Show ±1σ StdDev near the derivative line (just below it)
+		if pulse.StdDev > 0 {
+			stdDevText := canvas.NewText(fmt.Sprintf("±%.3f mV/s", pulse.StdDev*1000), color.RGBA{R: 150, G: 150, B: 150, A: 200})
+			stdDevText.TextSize = 9
+			stdDevText.Alignment = fyne.TextAlignCenter
+			stdDevText.Move(fyne.NewPos(x-40, yLine+5)) // Just below the fitted line
+			r.powerLabels = append(r.powerLabels, stdDevText)
+			r.objects = append(r.objects, stdDevText)
+		}
 	}
 }
 
